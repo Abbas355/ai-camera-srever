@@ -96,12 +96,51 @@ def decrypt_audio(data: bytearray, key: bytes) -> None:
         data[i : i + 16] = cipher.decrypt(bytes(data[i : i + 16]))
 
 
+def _prepare_ima_audio(
+    raw_full: bytes,
+    body: bytearray,
+    key: bytes,
+    need_decrypt: bool,
+    comm_version: int,
+) -> bytearray:
+    """0x16 is IMA ADPCM 8 kHz. v32 encrypts the 256-byte block with the media key."""
+    if not need_decrypt:
+        return bytearray(raw_full[16:] if len(raw_full) > 16 else body)
+    if comm_version == 21:
+        decrypt_pre2k(body, key)
+    else:
+        decrypt_audio(body, key)
+    return body
+
+
 def decrypt_pre2k(data: bytearray, key: bytes) -> None:
     n = (len(data) // 16) * 16
     if n <= 0:
         return
     cipher = AES.new(key, AES.MODE_ECB)
     data[:n] = cipher.decrypt(bytes(data[:n]))
+
+
+VIDEO_I = (0x00, 0x28)
+VIDEO_P = (0x01, 0x29)
+VIDEO_TYPES = VIDEO_I + VIDEO_P
+HEVC_TYPES = (0x28, 0x29)
+# 0x1A = G.711 A-law (v31). 0x16 = IMA ADPCM 8 kHz (v32 / original v380). 0x5B = ignore.
+AUDIO_ALAW = 0x1A
+AUDIO_IMA = 0x16
+AUDIO_TYPES = (AUDIO_ALAW, AUDIO_IMA)
+SKIP_TYPES = (0x5B,)
+FRAG_OK = VIDEO_TYPES + AUDIO_TYPES + SKIP_TYPES
+
+
+def _header_sizes_ok(pay_len: int, total: int, cur: int) -> bool:
+    return pay_len > 0 and pay_len <= 20000 and total > 0 and cur < total
+
+
+def has_annexb_start(body: bytes) -> bool:
+    if len(body) >= 4 and body[:4] == b"\x00\x00\x00\x01":
+        return True
+    return len(body) >= 3 and body[:3] == b"\x00\x00\x01"
 
 
 def find_nals(data: bytes) -> list[bytes]:
@@ -137,9 +176,47 @@ def extract_sps_pps(h264: bytes) -> tuple[bytes | None, bytes | None]:
     return sps, pps
 
 
+def extract_hevc_params(annexb: bytes) -> tuple[bytes | None, bytes | None, bytes | None]:
+    vps = sps = pps = None
+    for nal in find_nals(annexb):
+        if not nal:
+            continue
+        t = (nal[0] >> 1) & 0x3F
+        if t == 32:
+            vps = nal
+        elif t == 33:
+            sps = nal
+        elif t == 34:
+            pps = nal
+    return vps, sps, pps
+
+
 def prepend_sps_pps(idr: bytes, sps: bytes, pps: bytes) -> bytes:
     sc = b"\x00\x00\x00\x01"
     return sc + sps + sc + pps + idr
+
+
+def prepend_hevc_params(idr: bytes, vps: bytes, sps: bytes, pps: bytes) -> bytes:
+    sc = b"\x00\x00\x00\x01"
+    return sc + vps + sc + sps + sc + pps + idr
+
+
+def looks_like_hevc(annexb: bytes) -> bool:
+    for nal in find_nals(annexb):
+        if not nal:
+            continue
+        t = (nal[0] >> 1) & 0x3F
+        if t in (32, 33, 34, 19, 20, 21):
+            return True
+        break
+    return False
+
+
+def has_hevc_vps(annexb: bytes) -> bool:
+    for nal in find_nals(annexb):
+        if nal and ((nal[0] >> 1) & 0x3F) == 32:
+            return True
+    return False
 
 
 def recv_exact(sock: socket.socket, n: int, timeout: float = 8.0) -> bytes:
@@ -226,6 +303,7 @@ class V380SnapshotClient:
         self.password = password
         self.quality = 1 if quality else 0
         self.source = source if source in ("lan", "cloud") else "lan"
+        self.audio_enable = 4097
         self.auth_ticket = 0
         self.session_id = 0
         self.device_version = 0
@@ -235,8 +313,16 @@ class V380SnapshotClient:
         self.aes_key = b"\x00" * 16
         self._sock: socket.socket | None = None
         self._rx: RecvBuf | None = None
+        self._vps: bytes | None = None
         self._sps: bytes | None = None
         self._pps: bytes | None = None
+        self.video_codec = "h264"
+        self.audio_codec = "alaw"
+        self.audio_hz = 8
+        self.audio_bits = 16
+        self.audio_ch = 1
+        self._stream_info = b""
+        self.frame_stats: dict[int, int] = {}
         self._send_lock = threading.Lock()
 
     def close(self) -> None:
@@ -317,7 +403,7 @@ class V380SnapshotClient:
             pkt[8:12] = _u32(0)
             pkt[12:14] = _u16(20)
             pkt[14:18] = _u32(self.auth_ticket)
-            pkt[22:26] = _u32(4097)
+            pkt[22:26] = _u32(self.audio_enable)
             pkt[26:30] = _u32(self.quality)
         sock.sendall(pkt)
 
@@ -337,10 +423,15 @@ class V380SnapshotClient:
 
         rest = rx.pull(24, timeout=1.0)
         info = head + rest
+        self._stream_info = bytes(info)
         if len(info) >= 18:
             self.comm_version = _ru16(info, 8)
             self.frame_width = _ru32(info, 10) or 1280
             self.frame_height = _ru32(info, 14) or 720
+        if len(info) >= 25:
+            self.audio_hz = info[22]
+            self.audio_bits = info[23]
+            self.audio_ch = info[24]
         if self.device_version > 30:
             self.aes_key = media_aes_key(self.auth_ticket)
         self._sock = sock
@@ -386,7 +477,7 @@ class V380SnapshotClient:
             total = _ru16(header, 3)
             cur = _ru16(header, 5)
             pay_len = _ru16(header, 7)
-            if ftype not in (0x00, 0x01, 0x1A, 0x5B) or pay_len == 0 or pay_len > 20000 or total == 0 or cur >= total:
+            if not _header_sizes_ok(pay_len, total, cur):
                 # false 0x7F in payload — drop one byte and resync
                 self._rx.feed(header[1:])
                 continue
@@ -394,8 +485,8 @@ class V380SnapshotClient:
             if len(payload) < pay_len:
                 self._rx.feed(header[1:] + payload)
                 continue
-
-            if ftype not in (0x00, 0x01):
+            self.frame_stats[ftype] = self.frame_stats.get(ftype, 0) + 1
+            if ftype in SKIP_TYPES or ftype not in VIDEO_TYPES:
                 continue
             if cur == 0 or total != video_total:
                 video = bytearray()
@@ -413,15 +504,12 @@ class V380SnapshotClient:
                     decrypt_pre2k(body, self.aes_key)
                 else:
                     decrypt_video(body, self.aes_key)
-            if len(body) < 4 or body[:4] != b"\x00\x00\x00\x01":
+            if not has_annexb_start(body):
                 continue
-            if ftype != 0x00:
+            if ftype not in VIDEO_I:
                 continue
-            sps, pps = extract_sps_pps(bytes(body))
-            if sps:
-                self._sps = sps
-            if pps:
-                self._pps = pps
+            self._note_codec(ftype)
+            self._cache_params(ftype, bytes(body))
             return bytes(body)
 
         raise RuntimeError("Timed out waiting for I-frame")
@@ -436,6 +524,7 @@ class V380SnapshotClient:
         video_total = 0
         audio_total = 0
         last_type = 0
+        last_audio = 0
 
         while stop_event is None or not stop_event.is_set():
             if not self._rx.find_sync(20.0, stop_event):
@@ -455,33 +544,43 @@ class V380SnapshotClient:
             total = _ru16(header, 3)
             cur = _ru16(header, 5)
             pay_len = _ru16(header, 7)
-            if ftype not in (0x00, 0x01, 0x1A, 0x5B) or pay_len == 0 or pay_len > 20000 or total == 0 or cur >= total:
+            if not _header_sizes_ok(pay_len, total, cur):
                 self._rx.feed(header[1:])
                 continue
             payload = self._rx.pull(pay_len, timeout=8)
             if len(payload) < pay_len:
                 self._rx.feed(header[1:] + payload)
                 continue
-            if ftype == 0x1A:
+            self.frame_stats[ftype] = self.frame_stats.get(ftype, 0) + 1
+            if ftype in SKIP_TYPES:
+                continue
+            if ftype in AUDIO_TYPES:
                 if cur == 0 or total != audio_total:
                     audio = bytearray()
                     audio_total = total
+                    last_audio = ftype
                 audio.extend(payload)
                 if cur != total - 1:
                     continue
                 if len(audio) < 16:
                     audio = bytearray()
                     continue
+                raw_full = bytes(audio)
                 body = bytearray(audio[16:])
                 audio = bytearray()
-                if need_decrypt:
-                    if self.comm_version == 21:
-                        decrypt_pre2k(body, self.aes_key)
-                    else:
-                        decrypt_audio(body, self.aes_key)
+                if last_audio == AUDIO_IMA:
+                    self.audio_codec = "ima"
+                    body = _prepare_ima_audio(raw_full, body, self.aes_key, need_decrypt, self.comm_version)
+                else:
+                    self.audio_codec = "alaw"
+                    if need_decrypt:
+                        if self.comm_version == 21:
+                            decrypt_pre2k(body, self.aes_key)
+                        else:
+                            decrypt_audio(body, self.aes_key)
                 yield "audio", False, bytes(body)
                 continue
-            if ftype not in (0x00, 0x01):
+            if ftype not in VIDEO_TYPES:
                 continue
             if cur == 0 or total != video_total:
                 video = bytearray()
@@ -500,17 +599,38 @@ class V380SnapshotClient:
                     decrypt_pre2k(body, self.aes_key)
                 else:
                     decrypt_video(body, self.aes_key)
-            if len(body) < 4 or body[:4] != b"\x00\x00\x00\x01":
+            if not has_annexb_start(body):
                 continue
-            if last_type == 0x00:
-                sps, pps = extract_sps_pps(bytes(body))
-                if sps:
-                    self._sps = sps
-                if pps:
-                    self._pps = pps
-            yield "video", last_type == 0x00, bytes(body)
+            self._note_codec(last_type)
+            if last_type in VIDEO_I:
+                self._cache_params(last_type, bytes(body))
+            yield "video", last_type in VIDEO_I, bytes(body)
+
+    def _note_codec(self, ftype: int) -> None:
+        if ftype in HEVC_TYPES:
+            self.video_codec = "hevc"
+
+    def _cache_params(self, ftype: int, body: bytes) -> None:
+        if ftype in HEVC_TYPES:
+            vps, sps, pps = extract_hevc_params(body)
+            if vps:
+                self._vps = vps
+            if sps:
+                self._sps = sps
+            if pps:
+                self._pps = pps
+            return
+        sps, pps = extract_sps_pps(body)
+        if sps:
+            self._sps = sps
+        if pps:
+            self._pps = pps
 
     def h264_for_decode(self, iframe: bytes) -> bytes:
+        if self.video_codec == "hevc":
+            if self._vps and self._sps and self._pps and not has_hevc_vps(iframe):
+                return prepend_hevc_params(iframe, self._vps, self._sps, self._pps)
+            return iframe
         if self._sps and self._pps:
             return prepend_sps_pps(iframe, self._sps, self._pps)
         return iframe
@@ -533,12 +653,14 @@ def _ffmpeg_exe() -> str | None:
 class LiveH264Decoder:
     """Persistent FFmpeg pipe: Annex-B in, JPEG out, every frame."""
 
-    def __init__(self, out_queue):
+    def __init__(self, out_queue, fmt: str = "h264"):
         import threading
 
         exe = _ffmpeg_exe()
         if not exe:
             raise RuntimeError("FFmpeg not available")
+        self.fmt = "hevc" if fmt == "hevc" else "h264"
+        probe = "65536" if self.fmt == "hevc" else "32"
         self.proc = subprocess.Popen(
             [
                 exe,
@@ -550,11 +672,11 @@ class LiveH264Decoder:
                 "-flags",
                 "low_delay",
                 "-probesize",
-                "32",
+                probe,
                 "-analyzeduration",
                 "0",
                 "-f",
-                "h264",
+                self.fmt,
                 "-i",
                 "pipe:0",
                 "-f",
@@ -578,8 +700,15 @@ class LiveH264Decoder:
         self._reader.start()
         self._writer.start()
 
-    def write_frame(self, is_iframe: bool, payload: bytes, sps: bytes | None, pps: bytes | None) -> None:
-        item = (is_iframe, payload, sps, pps)
+    def write_frame(
+        self,
+        is_iframe: bool,
+        payload: bytes,
+        sps: bytes | None,
+        pps: bytes | None,
+        vps: bytes | None = None,
+    ) -> None:
+        item = (is_iframe, payload, sps, pps, vps)
         if self._in_q.full():
             try:
                 self._in_q.get_nowait()
@@ -593,13 +722,15 @@ class LiveH264Decoder:
     def _write_loop(self) -> None:
         while not self._stop.is_set():
             try:
-                is_iframe, payload, sps, pps = self._in_q.get(timeout=0.25)
+                is_iframe, payload, sps, pps, vps = self._in_q.get(timeout=0.25)
             except queue.Empty:
                 continue
             if self.proc.stdin is None:
                 break
             chunk = payload
-            if is_iframe and sps and pps:
+            if is_iframe and self.fmt == "hevc" and vps and sps and pps and not has_hevc_vps(payload):
+                chunk = prepend_hevc_params(payload, vps, sps, pps)
+            elif is_iframe and self.fmt != "hevc" and sps and pps:
                 chunk = prepend_sps_pps(payload, sps, pps)
             try:
                 self.proc.stdin.write(chunk)
@@ -661,13 +792,14 @@ def _pop_jpeg(buf: bytearray) -> bytes | None:
 
 
 def h264_to_jpeg(h264: bytes) -> bytes:
+    fmt = "hevc" if looks_like_hevc(h264) else "h264"
     jpeg = _decode_opencv(h264)
     if jpeg:
         return jpeg
-    jpeg = _decode_ffmpeg(h264)
+    jpeg = _decode_ffmpeg(h264, fmt)
     if jpeg:
         return jpeg
-    raise RuntimeError("Could not decode H.264 (install opencv-python or ffmpeg)")
+    raise RuntimeError("Could not decode video (install opencv-python or ffmpeg)")
 
 
 def _decode_opencv(h264: bytes) -> bytes | None:
@@ -688,7 +820,7 @@ def _decode_opencv(h264: bytes) -> bytes | None:
         cap.release()
 
 
-def _decode_ffmpeg(h264: bytes) -> bytes | None:
+def _decode_ffmpeg(h264: bytes, fmt: str = "h264") -> bytes | None:
     try:
         proc = subprocess.run(
             [
@@ -697,7 +829,7 @@ def _decode_ffmpeg(h264: bytes) -> bytes | None:
                 "-loglevel",
                 "error",
                 "-f",
-                "h264",
+                fmt,
                 "-i",
                 "pipe:0",
                 "-frames:v",

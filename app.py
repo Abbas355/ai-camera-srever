@@ -46,6 +46,7 @@ class SnapshotApp(tk.Tk):
         self._fps_t = 0.0
         self._photo: ImageTk.PhotoImage | None = None
         self._quality_name = "HD"
+        self._codec_label = "H.264"
         self._devices = []
 
         self._build()
@@ -166,6 +167,10 @@ class SnapshotApp(tk.Tk):
     def _set_status(self, text: str) -> None:
         self.status.configure(text=text)
 
+    def _set_codec(self, label: str) -> None:
+        self._codec_label = label
+        self._set_status(f"Live  {label}  {self._quality_name}")
+
     def _discover(self) -> None:
         self._set_status("Scanning LAN UDP 10008/10009 …")
 
@@ -213,7 +218,11 @@ class SnapshotApp(tk.Tk):
     def _toggle_listen(self) -> None:
         self._player.enabled = not self._player.enabled
         self.listen_btn.configure(text="Listen ON" if self._player.enabled else "Listen OFF", bg=GREEN if self._player.enabled else "#334155")
-        self._set_status("Camera mic ON — you should hear live audio" if self._player.enabled else "Listen off")
+        if self._player.enabled:
+            ac = "IMA ADPCM" if self._client and self._client.audio_codec == "ima" else "G.711"
+            self._set_status(f"Listen ON ({ac}, 8 kHz) — use PC speakers")
+        else:
+            self._set_status("Listen off")
 
     def _snapshot(self) -> None:
         if not self._last_jpeg:
@@ -233,7 +242,8 @@ class SnapshotApp(tk.Tk):
             if self._client is None:
                 self._set_status("Connect first, then Record")
                 return
-            path = self._recorder.start()
+            fmt = self._client.video_codec if self._client is not None else "h264"
+            path = self._recorder.start(fmt)
             self.rec_btn.configure(text="Stop rec", bg="#7f1d1d")
             self._set_status(f"Recording…  {path.name}")
 
@@ -288,21 +298,25 @@ class SnapshotApp(tk.Tk):
                     client = V380SnapshotClient(host, device_id, user, password, port, quality=quality, source=source)
                     client.connect()
                     self._client = client
-                    decoder = LiveH264Decoder(self._frames)
-                    self._decoder = decoder
+                    decoder = None
                     got_key = False
                     for kind, is_iframe, payload in client.iter_video_frames(self._stop):
                         if kind == "audio":
-                            self._player.play(payload)
+                            self._player.play(payload, client.audio_codec)
                             continue
+                        if decoder is None:
+                            decoder = LiveH264Decoder(self._frames, fmt=client.video_codec)
+                            self._decoder = decoder
+                            codec = "H.265" if client.video_codec == "hevc" else "H.264"
+                            self.after(0, lambda c=codec: self._set_codec(c))
                         if is_iframe:
                             got_key = True
                         if not got_key:
                             continue
-                        decoder.write_frame(True if is_iframe else False, payload, client._sps, client._pps)
+                        decoder.write_frame(bool(is_iframe), payload, client._sps, client._pps, client._vps)
                         if self._recorder.active:
                             rec = payload
-                            if is_iframe and client._sps and client._pps:
+                            if is_iframe:
                                 rec = client.h264_for_decode(payload)
                             self._recorder.write(rec)
                     break
@@ -371,8 +385,11 @@ class SnapshotApp(tk.Tk):
                 self._fps_count = 0
                 self._fps_t = now
                 rec = "  REC" if self._recorder.active else ""
-                mic = "  MIC" if self._player.enabled else ""
-                self._set_status(f"Live  {self._quality_name}  {fps:.0f} fps{mic}{rec}")
+                mic = ""
+                if self._player.enabled:
+                    ac = "IMA" if self._client and self._client.audio_codec == "ima" else "G.711"
+                    mic = f"  MIC {ac}"
+                self._set_status(f"Live  {self._codec_label}  {self._quality_name}  {fps:.0f} fps{mic}{rec}")
         self.after(16, self._drain_frames)
 
     def _on_close(self) -> None:

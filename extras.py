@@ -93,6 +93,49 @@ def _tcp_ok(ip: str, port: int, timeout: float = 3.0) -> bool:
         return False
 
 
+# IMA ADPCM (WAV type 0x11) — V380 0x16 frames are 256-byte blocks at 8 kHz mono.
+# Layout after the 16-byte V380 header: predictor s16le, step index u8, reserved u8, nibbles.
+_IMA_INDEX = (-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8)
+_IMA_STEP = (
+    7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41, 45,
+    50, 55, 60, 66, 73, 80, 88, 97, 107, 118, 130, 143, 157, 173, 190, 209, 230,
+    253, 279, 307, 337, 371, 408, 449, 494, 544, 598, 658, 724, 796, 876, 963,
+    1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066, 2272, 2499, 2749, 3024, 3327,
+    3660, 4026, 4428, 4871, 5358, 5894, 6484, 7132, 7845, 8630, 9493, 10442,
+    11487, 12635, 13899, 15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794,
+    32767,
+)
+
+
+def ima_adpcm_to_pcm16(data: bytes) -> bytes:
+    out = bytearray()
+    for off in range(0, len(data), 256):
+        block = data[off : off + 256]
+        if len(block) < 8:
+            break
+        pred = struct.unpack_from("<h", block, 0)[0]
+        index = block[2]
+        if index > 88:
+            continue
+        step = _IMA_STEP[index]
+        out += struct.pack("<h", pred)
+        for b in block[4:]:
+            for nibble in (b & 0x0F, b >> 4):
+                diff = step >> 3
+                if nibble & 4:
+                    diff += step
+                if nibble & 2:
+                    diff += step >> 1
+                if nibble & 1:
+                    diff += step >> 2
+                pred = pred - diff if nibble & 8 else pred + diff
+                pred = max(-32767, min(32767, pred))
+                index = max(0, min(88, index + _IMA_INDEX[nibble]))
+                step = _IMA_STEP[index]
+                out += struct.pack("<h", pred)
+    return bytes(out)
+
+
 def alaw_to_pcm16(alaw: bytes) -> bytes:
     try:
         import audioop
@@ -129,10 +172,12 @@ class AlawPlayer:
         except Exception:
             self._sd = None
 
-    def play(self, alaw: bytes) -> None:
+    def play(self, data: bytes, codec: str = "alaw") -> None:
         if not self.enabled or self._stream is None:
             return
-        pcm = alaw_to_pcm16(alaw)
+        pcm = ima_adpcm_to_pcm16(data) if codec == "ima" else alaw_to_pcm16(data)
+        if not pcm:
+            return
         try:
             self._stream.write(pcm)
         except Exception:
@@ -155,10 +200,13 @@ class H264Recorder:
         self._fh = None
         self._path: Path | None = None
         self.active = False
+        self._fmt = "h264"
 
-    def start(self) -> Path:
+    def start(self, fmt: str = "h264") -> Path:
         self.stop()
-        name = datetime.now().strftime("rec_%Y%m%d_%H%M%S.h264")
+        self._fmt = "hevc" if fmt == "hevc" else "h264"
+        ext = "h265" if self._fmt == "hevc" else "h264"
+        name = datetime.now().strftime(f"rec_%Y%m%d_%H%M%S.{ext}")
         self._path = self.folder / name
         self._fh = self._path.open("wb")
         self.active = True
@@ -181,7 +229,7 @@ class H264Recorder:
             if exe:
                 try:
                     subprocess.run(
-                        [exe, "-y", "-hide_banner", "-loglevel", "error", "-f", "h264", "-i", str(path), "-c", "copy", str(mp4)],
+                        [exe, "-y", "-hide_banner", "-loglevel", "error", "-f", self._fmt, "-i", str(path), "-c", "copy", str(mp4)],
                         timeout=20,
                         check=False,
                     )
