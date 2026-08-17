@@ -1,0 +1,11 @@
+"""Shared UI colors."""
+
+BG = "#0b1220"
+CARD = "#111827"
+TEXT = "#e5e7eb"
+MUTED = "#94a3b8"
+ACCENT = "#2563eb"
+GREEN = "#16a34a"
+ORANGE = "#ea580c"
+RED = "#dc2626"
+TILE = "#020617"

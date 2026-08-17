@@ -653,7 +653,15 @@ def _ffmpeg_exe() -> str | None:
 class LiveH264Decoder:
     """Persistent FFmpeg pipe: Annex-B in, JPEG out, every frame."""
 
-    def __init__(self, out_queue, fmt: str = "h264"):
+    def __init__(
+        self,
+        out_queue,
+        fmt: str = "h264",
+        *,
+        scale_width: int = 0,
+        jpeg_q: int = 6,
+        threads: int | None = None,
+    ):
         import threading
 
         exe = _ffmpeg_exe()
@@ -661,32 +669,28 @@ class LiveH264Decoder:
             raise RuntimeError("FFmpeg not available")
         self.fmt = "hevc" if fmt == "hevc" else "h264"
         probe = "65536" if self.fmt == "hevc" else "32"
+        cmd = [
+            exe,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-fflags",
+            "nobuffer",
+            "-flags",
+            "low_delay",
+            "-probesize",
+            probe,
+            "-analyzeduration",
+            "0",
+        ]
+        if threads is not None:
+            cmd.extend(["-threads", str(threads)])
+        cmd.extend(["-f", self.fmt, "-i", "pipe:0"])
+        if scale_width > 0:
+            cmd.extend(["-vf", f"scale={scale_width}:-2"])
+        cmd.extend(["-f", "image2pipe", "-vcodec", "mjpeg", "-q:v", str(jpeg_q), "pipe:1"])
         self.proc = subprocess.Popen(
-            [
-                exe,
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-fflags",
-                "nobuffer",
-                "-flags",
-                "low_delay",
-                "-probesize",
-                probe,
-                "-analyzeduration",
-                "0",
-                "-f",
-                self.fmt,
-                "-i",
-                "pipe:0",
-                "-f",
-                "image2pipe",
-                "-vcodec",
-                "mjpeg",
-                "-q:v",
-                "6",
-                "pipe:1",
-            ],
+            cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
