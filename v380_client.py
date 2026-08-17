@@ -87,6 +87,15 @@ def decrypt_video(data: bytearray, key: bytes) -> None:
         offset += 80
 
 
+def decrypt_audio(data: bytearray, key: bytes) -> None:
+    aligned = (len(data) // 16) * 16
+    if aligned == 0:
+        return
+    cipher = AES.new(key, AES.MODE_ECB)
+    for i in range(0, aligned, 16):
+        data[i : i + 16] = cipher.decrypt(bytes(data[i : i + 16]))
+
+
 def decrypt_pre2k(data: bytearray, key: bytes) -> None:
     n = (len(data) // 16) * 16
     if n <= 0:
@@ -208,6 +217,7 @@ class V380SnapshotClient:
         password: str,
         port: int = 8800,
         quality: int = 1,
+        source: str = "lan",
     ):
         self.ip = ip
         self.port = port
@@ -215,6 +225,7 @@ class V380SnapshotClient:
         self.username = username
         self.password = password
         self.quality = 1 if quality else 0
+        self.source = source if source in ("lan", "cloud") else "lan"
         self.auth_ticket = 0
         self.session_id = 0
         self.device_version = 0
@@ -254,14 +265,22 @@ class V380SnapshotClient:
         try:
             pkt = bytearray(520)
             pkt[0:4] = _u32(1167)
-            pkt[4:8] = _u32(120)
             pkt[8] = 31
             pkt[9:13] = _u32(1)
             pkt[13:17] = _u32(self.device_id)
             user = self.username.encode("ascii", errors="ignore")[:32]
-            pkt[49 : 49 + len(user)] = user
             pw = encrypt_password(self.password)
-            pkt[81 : 81 + len(pw)] = pw
+            if self.source == "cloud":
+                pkt[4:8] = _u32(1022)
+                host = f"{self.device_id}.nvdvr.net".encode("ascii")[:50]
+                pkt[17 : 17 + len(host)] = host
+                pkt[67:71] = _u32(self.port)
+                pkt[71 : 71 + len(user)] = user
+                pkt[103 : 103 + len(pw)] = pw
+            else:
+                pkt[4:8] = _u32(120)
+                pkt[49 : 49 + len(user)] = user
+                pkt[81 : 81 + len(pw)] = pw
             sock.sendall(pkt)
             resp = recv_exact(sock, 256, timeout=8)
             if len(resp) < 16:
@@ -282,12 +301,24 @@ class V380SnapshotClient:
         sock = self._tcp()
         pkt = bytearray(256)
         pkt[0:4] = _u32(301)
-        pkt[4:8] = _u32(self.device_id)
-        pkt[8:12] = _u32(0)
-        pkt[12:14] = _u16(20)
-        pkt[14:18] = _u32(self.auth_ticket)
-        pkt[22:26] = _u32(4097)
-        pkt[26:30] = _u32(self.quality)
+        if self.source == "cloud":
+            pkt[4:8] = _u32(1022)
+            host = f"{self.device_id}.nvdvr.net".encode("ascii")[:50]
+            pkt[8 : 8 + len(host)] = host
+            pkt[58:62] = _u32(self.port)
+            pkt[62:66] = _u32(self.device_id)
+            pkt[66:70] = _u32(self.auth_ticket)
+            pkt[70:74] = _u32(self.session_id)
+            pkt[74:78] = _u32(self.quality)
+            pkt[78] = 20
+            pkt[79:83] = _u32(1)
+        else:
+            pkt[4:8] = _u32(self.device_id)
+            pkt[8:12] = _u32(0)
+            pkt[12:14] = _u16(20)
+            pkt[14:18] = _u32(self.auth_ticket)
+            pkt[22:26] = _u32(4097)
+            pkt[26:30] = _u32(self.quality)
         sock.sendall(pkt)
 
         rx = RecvBuf(sock)
@@ -401,7 +432,9 @@ class V380SnapshotClient:
             raise RuntimeError("Not connected")
         need_decrypt = self.device_version > 30
         video = bytearray()
+        audio = bytearray()
         video_total = 0
+        audio_total = 0
         last_type = 0
 
         while stop_event is None or not stop_event.is_set():
@@ -428,6 +461,25 @@ class V380SnapshotClient:
             payload = self._rx.pull(pay_len, timeout=8)
             if len(payload) < pay_len:
                 self._rx.feed(header[1:] + payload)
+                continue
+            if ftype == 0x1A:
+                if cur == 0 or total != audio_total:
+                    audio = bytearray()
+                    audio_total = total
+                audio.extend(payload)
+                if cur != total - 1:
+                    continue
+                if len(audio) < 16:
+                    audio = bytearray()
+                    continue
+                body = bytearray(audio[16:])
+                audio = bytearray()
+                if need_decrypt:
+                    if self.comm_version == 21:
+                        decrypt_pre2k(body, self.aes_key)
+                    else:
+                        decrypt_audio(body, self.aes_key)
+                yield "audio", False, bytes(body)
                 continue
             if ftype not in (0x00, 0x01):
                 continue
@@ -456,7 +508,7 @@ class V380SnapshotClient:
                     self._sps = sps
                 if pps:
                     self._pps = pps
-            yield last_type == 0x00, bytes(body)
+            yield "video", last_type == 0x00, bytes(body)
 
     def h264_for_decode(self, iframe: bytes) -> bytes:
         if self._sps and self._pps:
