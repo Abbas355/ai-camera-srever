@@ -18,8 +18,8 @@ class SnapshotApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("V380 Live Preview")
-        self.geometry("960x720")
-        self.minsize(720, 520)
+        self.geometry("1180x720")
+        self.minsize(900, 560)
         self.configure(bg="#1e2937")
 
         self._client: V380SnapshotClient | None = None
@@ -74,8 +74,83 @@ class SnapshotApp(tk.Tk):
         )
         self.status.pack(fill="x")
 
-        self.canvas = tk.Label(self, bg="#020617", text="No snapshot yet", fg="#64748b")
-        self.canvas.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        body = tk.Frame(self, bg="#1e2937")
+        body.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
+        self.canvas = tk.Label(body, bg="#020617", text="No snapshot yet", fg="#64748b")
+        self.canvas.pack(side="left", fill="both", expand=True, padx=(0, 10))
+
+        self._build_controls(body)
+
+    def _build_controls(self, parent: tk.Frame) -> None:
+        panel = tk.Frame(parent, bg="#0f172a", padx=12, pady=12, width=240)
+        panel.pack(side="right", fill="y")
+        panel.pack_propagate(False)
+
+        def title(text: str) -> None:
+            tk.Label(panel, text=text, fg="#94a3b8", bg="#0f172a", font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(8, 6))
+
+        title("PTZ  (hold to move)")
+        grid = tk.Frame(panel, bg="#0f172a")
+        grid.pack()
+
+        def ptz(row: int, col: int, label: str, cmd: str | None) -> None:
+            if not cmd:
+                tk.Frame(grid, width=64, height=36, bg="#0f172a").grid(row=row, column=col, padx=3, pady=3)
+                return
+            b = tk.Button(grid, text=label, width=7, bg="#0396FF", fg="white", relief="flat")
+            b.grid(row=row, column=col, padx=3, pady=3)
+            b.bind("<ButtonPress-1>", lambda _e, c=cmd: self._cmd(c))
+            b.bind("<ButtonRelease-1>", lambda _e: self._cmd("ptz_stop"))
+
+        ptz(0, 1, "UP", "ptz_up")
+        ptz(1, 0, "LEFT", "ptz_left")
+        stop = tk.Button(grid, text="STOP", width=7, bg="#334155", fg="white", relief="flat", command=lambda: self._cmd("ptz_stop"))
+        stop.grid(row=1, column=1, padx=3, pady=3)
+        ptz(1, 2, "RIGHT", "ptz_right")
+        ptz(2, 1, "DOWN", "ptz_down")
+
+        title("LIGHT")
+        lights = tk.Frame(panel, bg="#0f172a")
+        lights.pack(fill="x")
+        for i, (label, cmd) in enumerate((("ON", "light_on"), ("OFF", "light_off"), ("AUTO", "light_auto"))):
+            tk.Button(
+                lights, text=label, width=7, bg="#48bb78", fg="white", relief="flat",
+                command=lambda c=cmd: self._cmd(c),
+            ).grid(row=0, column=i, padx=3, pady=2)
+
+        title("IMAGE MODE")
+        imgs = tk.Frame(panel, bg="#0f172a")
+        imgs.pack(fill="x")
+        for i, (label, cmd) in enumerate((("COLOR", "image_color"), ("B&W", "image_bw"))):
+            tk.Button(
+                imgs, text=label, width=10, bg="#ed8936", fg="white", relief="flat",
+                command=lambda c=cmd: self._cmd(c),
+            ).grid(row=0, column=i, padx=3, pady=2)
+        for i, (label, cmd) in enumerate((("AUTO", "image_auto"), ("FLIP", "image_flip"))):
+            tk.Button(
+                imgs, text=label, width=10, bg="#ed8936", fg="white", relief="flat",
+                command=lambda c=cmd: self._cmd(c),
+            ).grid(row=1, column=i, padx=3, pady=2)
+
+        tk.Label(
+            panel,
+            text="Connect first.\nPTZ: hold a direction, release to stop.",
+            fg="#64748b",
+            bg="#0f172a",
+            justify="left",
+        ).pack(anchor="w", pady=(16, 0))
+
+    def _cmd(self, name: str) -> None:
+        client = self._client
+        if client is None:
+            self._set_status("Connect first, then use controls")
+            return
+        ok = client.send_control(name)
+        if ok:
+            self._set_status(f"Sent {name.replace('_', ' ')}")
+        else:
+            self._set_status(f"Control failed: {name}")
 
     def _set_status(self, text: str) -> None:
         self.status.configure(text=text)
