@@ -223,20 +223,26 @@ class H264Recorder:
             self._fh = None
         self.active = False
         self._path = None
-        if path and path.exists() and path.stat().st_size > 0:
-            mp4 = path.with_suffix(".mp4")
-            exe = _ffmpeg_exe()
-            if exe:
-                try:
-                    subprocess.run(
-                        [exe, "-y", "-hide_banner", "-loglevel", "error", "-f", self._fmt, "-i", str(path), "-c", "copy", str(mp4)],
-                        timeout=20,
-                        check=False,
-                    )
-                    if mp4.exists() and mp4.stat().st_size > 0:
-                        path.unlink(missing_ok=True)
-                        return mp4
-                except Exception:
-                    pass
-            return path
+        return remux_annexb(path, self._fmt)
+
+
+def remux_annexb(path: Path | None, fmt: str, timeout: int = 180) -> Path | None:
+    if path is None or not path.exists() or path.stat().st_size <= 0:
+        if path is not None:
+            path.unlink(missing_ok=True)
         return None
+    mp4 = path.with_suffix(".mp4")
+    exe = _ffmpeg_exe()
+    if exe:
+        try:
+            subprocess.run(
+                [exe, "-y", "-hide_banner", "-loglevel", "error", "-f", fmt, "-i", str(path), "-c", "copy", str(mp4)],
+                timeout=timeout,
+                check=False,
+            )
+            if mp4.exists() and mp4.stat().st_size > 0:
+                path.unlink(missing_ok=True)
+                return mp4
+        except Exception:
+            pass
+    return path

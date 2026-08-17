@@ -28,9 +28,10 @@ def _decode_opts(count: int) -> dict:
 
 
 class PreviewManager:
-    def __init__(self, store: CameraStore, on_state: OnState, max_cams: int = 64):
+    def __init__(self, store: CameraStore, on_state: OnState, on_frame=None, max_cams: int = 64):
         self._store = store
         self._on_state = on_state
+        self._on_frame = on_frame
         self._max = max_cams
         self._stop = threading.Event()
         self._threads: dict[int, threading.Thread] = {}
@@ -97,6 +98,11 @@ class PreviewManager:
                 for kind, is_iframe, payload in client.iter_video_frames(stop):
                     if kind != "video":
                         continue
+                    if self._on_frame is not None:
+                        try:
+                            self._on_frame(cam, is_iframe, payload, client)
+                        except Exception:
+                            pass
                     if decoder is None:
                         decoder = LiveH264Decoder(
                             frames,

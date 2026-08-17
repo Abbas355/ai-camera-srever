@@ -8,6 +8,7 @@ from tkinter import messagebox, ttk
 
 from PIL import Image, ImageTk
 
+from auto_record import RecordSupervisor
 from camera_store import Camera, CameraStore
 from preview import PreviewManager
 from theme import ACCENT, BG, CARD, GREEN, MUTED, RED, TEXT, TILE
@@ -26,9 +27,10 @@ def _fit_contain(img: Image.Image, box_w: int, box_h: int) -> Image.Image:
 
 
 class HomeFrame(tk.Frame):
-    def __init__(self, master, store: CameraStore, on_add, on_view, on_edit):
+    def __init__(self, master, store: CameraStore, recorders: RecordSupervisor, on_add, on_view, on_edit):
         super().__init__(master, bg=BG)
         self.store = store
+        self._recorders = recorders
         self._on_add = on_add
         self._on_view = on_view
         self._on_edit = on_edit
@@ -70,13 +72,18 @@ class HomeFrame(tk.Frame):
             ).pack(expand=True)
             self._previews.stop()
             return
-        self.status.configure(text=f"{len(cameras)} camera(s)  ·  live mosaic")
+        rec_n = sum(1 for c in cameras if c.auto_record)
+        extra = "  ·  auto-record stays on after you close Studio" if rec_n else ""
+        self.status.configure(text=f"{len(cameras)} camera(s)  ·  live mosaic{extra}")
         self._layout_tiles(cameras)
         self._previews.start(cameras)
 
     def _layout_tiles(self, cameras: list[Camera]) -> None:
         n = len(cameras)
-        tiles = [_Tile(self._stage, cam, self._on_view, self._on_edit, self._delete) for cam in cameras]
+        tiles = [
+            _Tile(self._stage, cam, self._on_view, self._on_edit, self._delete, self._toggle_rec)
+            for cam in cameras
+        ]
         for cam, tile in zip(cameras, tiles):
             self._tiles[cam.id] = tile
 
@@ -138,16 +145,35 @@ class HomeFrame(tk.Frame):
                 tile.set_jpeg(jpeg)
             else:
                 tile.paint_if_dirty()
+            tile.set_rec(tile.cam.auto_record, self._recorders.is_recording(cam_id))
+        self._recorders.watch()
         self.after(16, self._drain_previews)
+
+    def _toggle_rec(self, cam: Camera) -> None:
+        cam.auto_record = not cam.auto_record
+        self.store.set_auto_record(cam.id, cam.auto_record)
+        self._recorders.sync(self.store.list())
+        tile = self._tiles.get(cam.id)
+        if tile is not None:
+            tile.cam = cam
+            tile.set_rec(cam.auto_record, self._recorders.is_recording(cam.id))
 
     def _delete(self, cam: Camera) -> None:
         if not messagebox.askyesno("Delete camera", f"Remove {cam.name} ({cam.device_id}) from this PC?"):
             return
         self.store.delete(cam.id)
+        self._recorders.sync(self.store.list())
         self.reload()
 
     def _push_state(self, camera_id: int, text: str) -> None:
-        self.after(0, lambda: self._show_state(camera_id, text))
+        if not self._drain_on:
+            return
+        try:
+            if not self.winfo_exists():
+                return
+            self.after(0, lambda: self._show_state(camera_id, text))
+        except Exception:
+            return
 
     def _show_state(self, camera_id: int, text: str) -> None:
         tile = self._tiles.get(camera_id)
@@ -156,7 +182,7 @@ class HomeFrame(tk.Frame):
 
 
 class _Tile(tk.Frame):
-    def __init__(self, master, cam: Camera, on_view, on_edit, on_delete):
+    def __init__(self, master, cam: Camera, on_view, on_edit, on_delete, on_rec):
         super().__init__(master, bg=CARD, padx=8, pady=8)
         self.cam = cam
         self._jpeg: bytes | None = None
@@ -174,7 +200,10 @@ class _Tile(tk.Frame):
         btns.pack(fill="x", pady=(6, 0))
         tk.Button(btns, text="View", bg=ACCENT, fg="white", relief="flat", width=8, command=lambda: on_view(cam)).pack(side="left", padx=(0, 6))
         tk.Button(btns, text="Edit", bg="#334155", fg="white", relief="flat", width=8, command=lambda: on_edit(cam)).pack(side="left", padx=(0, 6))
+        self._rec_btn = tk.Button(btns, text="Rec OFF", bg="#334155", fg="white", relief="flat", width=8, command=lambda: on_rec(cam))
+        self._rec_btn.pack(side="left", padx=(0, 6))
         tk.Button(btns, text="Delete", bg=RED, fg="white", relief="flat", width=8, command=lambda: on_delete(cam)).pack(side="left")
+        self.set_rec(cam.auto_record, False)
 
         self._view = tk.Canvas(self, bg=TILE, highlightthickness=0, cursor="hand2")
         self._view.pack(side="top", fill="both", expand=True)
@@ -224,6 +253,14 @@ class _Tile(tk.Frame):
         color = GREEN if text == "Live" else MUTED
         self._state.configure(text=text, fg=color)
 
+    def set_rec(self, enabled: bool, writing: bool) -> None:
+        if enabled and writing:
+            self._rec_btn.configure(text="REC ON", bg=RED)
+        elif enabled:
+            self._rec_btn.configure(text="REC…", bg="#7f1d1d")
+        else:
+            self._rec_btn.configure(text="Rec OFF", bg="#334155")
+
 
 class EditDialog(tk.Toplevel):
     def __init__(self, master, cam: Camera, on_save):
@@ -260,9 +297,20 @@ class EditDialog(tk.Toplevel):
         self.quality_e = ttk.Combobox(form, values=["HD", "SD"], width=25, state="readonly")
         self.quality_e.set(cam.quality_name)
         self.quality_e.grid(row=7, column=1, pady=4, padx=(8, 0))
+        self.rec_var = tk.IntVar(value=1 if cam.auto_record else 0)
+        tk.Checkbutton(
+            form,
+            text="Auto record (hourly MP4; keeps running after you close Studio)",
+            variable=self.rec_var,
+            fg=TEXT,
+            bg=BG,
+            selectcolor="#1f2937",
+            activebackground=BG,
+            activeforeground=TEXT,
+        ).grid(row=8, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
         tk.Button(form, text="Save", bg=ACCENT, fg="white", relief="flat", width=12, command=self._save).grid(
-            row=8, column=1, sticky="e", pady=(12, 0)
+            row=9, column=1, sticky="e", pady=(12, 0)
         )
 
     def _save(self) -> None:
@@ -284,6 +332,7 @@ class EditDialog(tk.Toplevel):
             password=self.pass_e.get(),
             source="cloud" if self.source_e.get() == "Cloud" else "lan",
             quality=1 if self.quality_e.get() == "HD" else 0,
+            auto_record=bool(self.rec_var.get()),
             created_at=self._cam.created_at,
             updated_at=self._cam.updated_at,
         )

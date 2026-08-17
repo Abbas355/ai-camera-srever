@@ -22,12 +22,21 @@ REC_DIR = Path(__file__).with_name("recordings")
 
 
 class LiveView(tk.Frame):
-    def __init__(self, master, on_back, on_connected=None, camera: Camera | None = None, auto_connect: bool = False):
+    def __init__(
+        self,
+        master,
+        on_back,
+        on_connected=None,
+        camera: Camera | None = None,
+        auto_connect: bool = False,
+        recorders=None,
+    ):
         super().__init__(master, bg=BG)
         self._on_back = on_back
         self._on_connected = on_connected
         self._preset = camera
         self._auto_connect = auto_connect
+        self._recorders = recorders
 
         self._client: V380SnapshotClient | None = None
         self._stop = threading.Event()
@@ -53,6 +62,16 @@ class LiveView(tk.Frame):
         self.after(16, self._drain_frames)
         if auto_connect and camera is not None:
             self.after(200, self._connect)
+
+    def _ui(self, fn) -> None:
+        if not self._alive:
+            return
+        try:
+            if not self.winfo_exists():
+                return
+            self.after(0, fn)
+        except Exception:
+            return
 
     def _build(self) -> None:
         top = tk.Frame(self, bg=CARD, padx=14, pady=10)
@@ -235,11 +254,11 @@ class LiveView(tk.Frame):
             try:
                 devs = discover_devices()
             except Exception as exc:
-                self.after(0, lambda: self._set_status(f"Discover failed: {exc}"))
+                self._ui( lambda: self._set_status(f"Discover failed: {exc}"))
                 return
             self._devices = devs
             labels = [f"{d.dev_id}  {d.ip}  {d.mac}" for d in devs]
-            self.after(0, lambda: self._show_devices(labels))
+            self._ui( lambda: self._show_devices(labels))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -342,28 +361,33 @@ class LiveView(tk.Frame):
                 try:
                     host = ip
                     if source == "cloud":
-                        self.after(0, lambda: self._set_status("Looking up cloud relay …"))
+                        self._ui( lambda: self._set_status("Looking up cloud relay …"))
                         host = get_relay_ip(device_id)
                         if not host:
                             raise RuntimeError("No reachable cloud relay")
-                        self.after(0, lambda h=host: self._set_status(f"Relay {h}"))
+                        self._ui( lambda h=host: self._set_status(f"Relay {h}"))
                     client = V380SnapshotClient(host, device_id, user, password, port, quality=quality, source=source)
                     client.connect()
                     self._client = client
                     if not self._saved_once and self._on_connected is not None:
                         self._saved_once = True
-                        self.after(0, lambda f=fields: self._on_connected(f))
+                        self._ui( lambda f=fields: self._on_connected(f))
                     decoder = None
                     got_key = False
                     for kind, is_iframe, payload in client.iter_video_frames(self._stop):
                         if kind == "audio":
                             self._player.play(payload, client.audio_codec)
                             continue
+                        if self._recorders is not None and self._preset is not None:
+                            try:
+                                self._recorders.on_video(self._preset, is_iframe, payload, client)
+                            except Exception:
+                                pass
                         if decoder is None:
                             decoder = LiveH264Decoder(self._frames, fmt=client.video_codec)
                             self._decoder = decoder
                             codec = "H.265" if client.video_codec == "hevc" else "H.264"
-                            self.after(0, lambda c=codec: self._set_codec(c))
+                            self._ui( lambda c=codec: self._set_codec(c))
                         if is_iframe:
                             got_key = True
                         if not got_key:
@@ -380,9 +404,9 @@ class LiveView(tk.Frame):
                     if self._stop.is_set():
                         break
                     if "invalid username" in msg or "invalid password" in msg or "invalid device id" in msg:
-                        self.after(0, lambda m=msg: self._fail(m))
+                        self._ui( lambda m=msg: self._fail(m))
                         break
-                    self.after(0, lambda m=msg: self._set_status(f"Reconnecting… ({m})"))
+                    self._ui( lambda m=msg: self._set_status(f"Reconnecting… ({m})"))
                     time.sleep(1.5)
                 finally:
                     if decoder is not None:
@@ -394,7 +418,7 @@ class LiveView(tk.Frame):
                     if self._client is client:
                         self._client = None
             if not self._stop.is_set() and self._alive:
-                self.after(0, lambda: self.connect_btn.configure(text="Connect", bg=ACCENT))
+                self._ui( lambda: self.connect_btn.configure(text="Connect", bg=ACCENT))
 
         self._thread = threading.Thread(target=worker, daemon=True)
         self._thread.start()

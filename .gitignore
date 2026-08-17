@@ -5,5 +5,10 @@ data/*.db-journal
 data/*.db-wal
 data/*.db-shm
 data/master.key
+data/record_worker.pid
+data/record_worker.json
+data/record_worker.json.tmp
+data/record_worker.log
+data/studio.lease
 recordings/
 last_snapshot.jpg

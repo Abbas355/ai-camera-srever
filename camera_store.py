@@ -32,6 +32,7 @@ class Camera:
     password: str
     source: str
     quality: int
+    auto_record: bool
     created_at: str
     updated_at: str
 
@@ -81,12 +82,12 @@ class CameraStore:
                     """
                     UPDATE cameras SET
                         name=?, mac=?, ip=?, port=?, username=?, password_enc=?,
-                        source=?, quality=?, updated_at=?
+                        source=?, quality=?, auto_record=?, updated_at=?
                     WHERE device_id=?
                     """,
                     (
                         cam.name, cam.mac, cam.ip, cam.port, cam.username, blob,
-                        cam.source, cam.quality, now, cam.device_id,
+                        cam.source, cam.quality, 1 if cam.auto_record else 0, now, cam.device_id,
                     ),
                 )
                 camera_id = int(existing["id"])
@@ -94,12 +95,12 @@ class CameraStore:
                 cur = self._conn.execute(
                     """
                     INSERT INTO cameras
-                        (name, device_id, mac, ip, port, username, password_enc, source, quality, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        (name, device_id, mac, ip, port, username, password_enc, source, quality, auto_record, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         cam.name, cam.device_id, cam.mac, cam.ip, cam.port, cam.username, blob,
-                        cam.source, cam.quality, now, now,
+                        cam.source, cam.quality, 1 if cam.auto_record else 0, now, now,
                     ),
                 )
                 camera_id = int(cur.lastrowid)
@@ -117,12 +118,12 @@ class CameraStore:
                 """
                 UPDATE cameras SET
                     name=?, device_id=?, mac=?, ip=?, port=?, username=?, password_enc=?,
-                    source=?, quality=?, updated_at=?
+                    source=?, quality=?, auto_record=?, updated_at=?
                 WHERE id=?
                 """,
                 (
                     cam.name, cam.device_id, cam.mac, cam.ip, cam.port, cam.username, blob,
-                    cam.source, cam.quality, now, cam.id,
+                    cam.source, cam.quality, 1 if cam.auto_record else 0, now, cam.id,
                 ),
             )
             self._conn.commit()
@@ -130,6 +131,14 @@ class CameraStore:
         if saved is None:
             raise RuntimeError("Camera not found")
         return saved
+
+    def set_auto_record(self, camera_id: int, enabled: bool) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE cameras SET auto_record = ?, updated_at = ? WHERE id = ?",
+                (1 if enabled else 0, _now(), camera_id),
+            )
+            self._conn.commit()
 
     def delete(self, camera_id: int) -> None:
         with self._lock:
@@ -189,6 +198,7 @@ class CameraStore:
             password=decrypt(self._key, row["password_enc"]),
             source=row["source"],
             quality=int(row["quality"]),
+            auto_record=bool(row["auto_record"]) if "auto_record" in row.keys() else False,
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )

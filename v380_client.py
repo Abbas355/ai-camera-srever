@@ -739,7 +739,7 @@ class LiveH264Decoder:
             try:
                 self.proc.stdin.write(chunk)
                 self.proc.stdin.flush()
-            except (BrokenPipeError, OSError):
+            except (BrokenPipeError, OSError, ValueError):
                 break
 
     def _read_loop(self) -> None:
