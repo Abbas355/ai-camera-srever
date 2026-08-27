@@ -8,10 +8,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from db import connect
-from secretbox import decrypt, encrypt, load_or_create_key
+from v380.paths import DATA_DIR
+from v380.store.db import connect
+from v380.store.secretbox import decrypt, encrypt, load_or_create_key
 
-DATA_DIR = Path(__file__).with_name("data")
 DB_PATH = DATA_DIR / "v380.db"
 KEY_PATH = DATA_DIR / "master.key"
 

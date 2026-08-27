@@ -3,7 +3,7 @@
 import sys
 from pathlib import Path
 
-from v380_client import V380SnapshotClient, h264_to_jpeg
+from v380.client.v380_client import V380SnapshotClient, h264_to_jpeg
 
 
 def main() -> int:

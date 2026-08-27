@@ -2,28 +2,111 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
 import sys
+import threading
+import urllib.request
 from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-from auto_record import rename_legacy_names
-from theme import ACCENT, BG, CARD, MUTED, TEXT, TILE
+from v380.paths import DATA_DIR, REC_DIR
+from v380.record.auto_record import rename_legacy_names
+from v380.ui.theme import ACCENT, BG, CARD, MUTED, TEXT, TILE
+from v380.client.v380_client import _ffmpeg_exe, _win_hide_kwargs
 
-REC_DIR = Path(__file__).with_name("recordings")
+CACHE_DIR = DATA_DIR / "clip_cache"
 VIDEO_EXT = {".mp4", ".h264", ".h265"}
 _HH = re.compile(r"^\d{2}$")
+SERVER_FILE = DATA_DIR / "server.txt"
 
 
-def _play(path: Path) -> None:
+def _play_file(path: Path) -> None:
     if sys.platform == "win32":
         os.startfile(path)
         return
     opener = "open" if sys.platform == "darwin" else "xdg-open"
     subprocess.Popen([opener, str(path)], start_new_session=True)
+
+
+def _to_mp4(src: Path) -> Path:
+    if src.suffix.lower() == ".mp4":
+        return src
+    dest = src.with_suffix(".mp4")
+    if dest.is_file() and dest.stat().st_size > 1024:
+        return dest
+    exe = _ffmpeg_exe()
+    if not exe:
+        return src
+    subprocess.run(
+        [exe, "-y", "-i", str(src), "-c", "copy", "-movflags", "+faststart", str(dest)],
+        check=False,
+        **_win_hide_kwargs(),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return dest if dest.is_file() and dest.stat().st_size > 1024 else src
+
+
+def _cache_remote(ref) -> Path:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    safe = ref.rel.replace("\\", "/").replace("..", "").replace("/", "_")
+    dest = CACHE_DIR / safe
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    expected = int(getattr(ref, "_size", 0) or 0)
+    if dest.is_file() and expected and dest.stat().st_size == expected:
+        return dest
+    req = urllib.request.Request(ref.url)
+    token = getattr(ref, "token", "") or ""
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+        req.add_header("X-Token", token)
+    with urllib.request.urlopen(req, timeout=120) as resp, dest.open("wb") as out:
+        while True:
+            chunk = resp.read(1024 * 256)
+            if not chunk:
+                break
+            out.write(chunk)
+    return dest
+
+
+class ClipRef:
+    def __init__(self, rel: str, size: int, base: str, token: str = ""):
+        self.rel = rel.replace("\\", "/")
+        p = Path(self.rel)
+        self.name = p.name
+        self.stem = p.stem
+        self.suffix = p.suffix
+        self.parent = p.parent
+        self._size = size
+        self.token = token
+        self.url = f"{base}/file/{self.rel}"
+
+    def is_file(self) -> bool:
+        return True
+
+    def stat(self):
+        return type("S", (), {"st_size": self._size})()
+
+
+def _index_remote(base: str, token: str = "") -> dict[str, dict[str, list]]:
+    req = urllib.request.Request(base.rstrip("/") + "/api/index")
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+        req.add_header("X-Token", token)
+    with urllib.request.urlopen(req, timeout=8) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+    cameras: dict[str, dict[str, list]] = {}
+    for cam, dates in (payload.get("cameras") or {}).items():
+        for day, items in dates.items():
+            clips = [ClipRef(it["rel"], int(it.get("size") or 0), base.rstrip("/"), token) for it in items]
+            clips.sort(key=lambda c: _clip_when(c))
+            cameras.setdefault(cam, {})[day] = clips
+    return cameras
 
 
 def _size_text(n: int) -> str:
@@ -75,22 +158,40 @@ def _index(root: Path) -> dict[str, dict[str, list[Path]]]:
 
 
 class ClipsFrame(tk.Frame):
-    def __init__(self, master, on_back):
+    def __init__(self, master, on_back, api=None):
         super().__init__(master, bg=BG)
         self._on_back = on_back
+        self._api = api
         self._data: dict[str, dict[str, list[Path]]] = {}
         self._camera = ""
         self._date = ""
         self._hour = ""
-        self._hour_files: dict[str, list[Path]] = {}
+        self._hour_files: dict[str, list] = {}
         self._hour_btns: dict[str, tk.Button] = {}
         self._date_btns: dict[str, tk.Button] = {}
+        self._remote = api.base if api is not None else ""
+        self._token = api.token if api is not None else ""
 
         top = tk.Frame(self, bg=CARD, padx=16, pady=12)
         top.pack(fill="x")
         tk.Button(top, text="← Home", bg="#334155", fg="white", relief="flat", command=self._on_back).pack(side="left")
         tk.Label(top, text="  Playback", fg="white", bg=CARD, font=("Segoe UI", 16, "bold")).pack(side="left", padx=(12, 0))
         tk.Button(top, text="Refresh", bg="#334155", fg="white", relief="flat", command=self.reload).pack(side="right")
+        tk.Label(top, text="Server IP", fg=MUTED, bg=CARD).pack(side="right", padx=(0, 8))
+        self._server_var = tk.StringVar()
+        if api is not None:
+            self._server_var.set(api.base.replace("http://", "").replace("https://", "").split(":")[0])
+        elif SERVER_FILE.is_file():
+            self._server_var.set(SERVER_FILE.read_text(encoding="utf-8").strip())
+        tk.Entry(top, textvariable=self._server_var, width=16, bg="#1f2937", fg=TEXT, insertbackground=TEXT, relief="flat").pack(
+            side="right", padx=(0, 8)
+        )
+        tk.Button(top, text="This PC", bg="#334155", fg="white", relief="flat", command=self._use_pc).pack(
+            side="right", padx=(0, 8)
+        )
+        tk.Button(top, text="Connect", bg=ACCENT, fg="white", relief="flat", command=self._use_server).pack(
+            side="right", padx=(0, 8)
+        )
 
         pick = tk.Frame(self, bg=CARD, padx=16, pady=12)
         pick.pack(fill="x")
@@ -137,13 +238,35 @@ class ClipsFrame(tk.Frame):
 
         self.reload()
 
+    def _use_pc(self) -> None:
+        self._remote = ""
+        self.reload()
+
+    def _use_server(self) -> None:
+        ip = self._server_var.get().strip()
+        if not ip:
+            messagebox.showinfo("Server", "Type the Ubuntu IP, then Connect.")
+            return
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        SERVER_FILE.write_text(ip, encoding="utf-8")
+        self._remote = ip if "://" in ip else f"http://{ip}:8080"
+        self._token = getattr(self._api, "token", "") if self._api is not None else ""
+        self.reload()
+
     def reload(self) -> None:
         keep_cam, keep_date, keep_hour = self._camera, self._date, self._hour
         try:
             rename_legacy_names(REC_DIR)
         except Exception:
             pass
-        self._data = _index(REC_DIR)
+        if self._remote:
+            try:
+                self._data = _index_remote(self._remote, getattr(self, "_token", "") or "")
+            except Exception as exc:
+                messagebox.showerror("Server", f"Cannot reach {self._remote}\n{exc}")
+                self._data = {}
+        else:
+            self._data = _index(REC_DIR)
         cameras = sorted(self._data)
         self._cam_box["values"] = cameras
         if not cameras:
@@ -151,7 +274,8 @@ class ClipsFrame(tk.Frame):
             self._clear_dates()
             self._clear_hours()
             self._clear_mins()
-            self.status.configure(text="No recordings yet. Turn Rec ON, then come back here.")
+            where = self._remote or str(REC_DIR)
+            self.status.configure(text=f"No recordings yet.  ·  {where}")
             return
         cam = keep_cam if keep_cam in cameras else cameras[0]
         self._cam_var.set(cam)
@@ -292,11 +416,24 @@ class ClipsFrame(tk.Frame):
         for child in self._mins.winfo_children():
             child.destroy()
 
-    def _play_path(self, path: Path) -> None:
+    def _play_path(self, path) -> None:
+        if getattr(path, "url", None):
+            self.status.configure(text="Opening clip in the player…")
+            threading.Thread(target=self._play_remote, args=(path,), daemon=True).start()
+            return
         if not path.is_file():
             messagebox.showinfo("Playback", "That clip is not on disk yet.")
             return
         try:
-            _play(path)
+            _play_file(path)
         except Exception as exc:
             messagebox.showerror("Play failed", str(exc))
+
+    def _play_remote(self, ref) -> None:
+        try:
+            local = _cache_remote(ref)
+            play = _to_mp4(local)
+            _play_file(play)
+            self.after(0, lambda: self.status.configure(text="Playing in the Windows player (not the browser)."))
+        except Exception as exc:
+            self.after(0, lambda: messagebox.showerror("Play failed", str(exc)))

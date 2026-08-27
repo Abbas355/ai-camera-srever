@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import os
+import queue
 import socket
 import struct
 import wave
@@ -18,7 +19,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from v380_client import _ffmpeg_exe, _win_hide_kwargs
+from v380.client.v380_client import _ffmpeg_exe, _win_hide_kwargs
+from v380.paths import AUDIO_DIR
 
 
 @dataclass
@@ -250,17 +252,27 @@ class AlawPlayer:
     def __init__(self):
         self.enabled = False
         self._stream = None
+        self._sd = None
+
+    def _ensure(self) -> bool:
+        if self._stream is not None:
+            return True
         try:
             import sounddevice as sd
 
             self._sd = sd
             self._stream = sd.RawOutputStream(samplerate=8000, channels=1, dtype="int16", blocksize=0)
             self._stream.start()
+            return True
         except Exception:
             self._sd = None
+            self._stream = None
+            return False
 
     def play(self, data: bytes, codec: str = "alaw") -> None:
-        if not self.enabled or self._stream is None:
+        if not self.enabled:
+            return
+        if not self._ensure():
             return
         pcm = ima_adpcm_to_pcm16(data) if codec == "ima" else alaw_to_pcm16(data)
         if not pcm:
@@ -280,8 +292,64 @@ class AlawPlayer:
             self._stream = None
 
 
+class _SharedMic:
+    """One process-wide mic so Windows does not keep asking permission."""
+
+    def __init__(self):
+        self.stream = None
+        self.rate = 8000
+        self._lock = threading.Lock()
+        self._listeners: list = []
+        self._sd = None
+
+    def add(self, talker) -> None:
+        with self._lock:
+            if talker not in self._listeners:
+                self._listeners.append(talker)
+            self._open()
+
+    def remove(self, talker) -> None:
+        with self._lock:
+            if talker in self._listeners:
+                self._listeners.remove(talker)
+
+    def _cb(self, indata, frames, time_info, status) -> None:
+        for talker in list(self._listeners):
+            try:
+                talker._on_mic(indata, frames, time_info, status)
+            except Exception:
+                pass
+
+    def _open(self) -> None:
+        if self.stream is not None:
+            return
+        import sounddevice as sd
+
+        self._sd = sd
+        last_err: Exception | None = None
+        for rate in (8000, 16000, 44100, 48000):
+            try:
+                stream = sd.RawInputStream(
+                    samplerate=rate,
+                    channels=1,
+                    dtype="int16",
+                    blocksize=max(160, int(rate * 0.02)),
+                    callback=self._cb,
+                )
+                stream.start()
+                self.stream = stream
+                self.rate = rate
+                return
+            except Exception as exc:
+                last_err = exc
+        raise last_err or RuntimeError("microphone blocked")
+
+
+_SHARED_MIC = _SharedMic()
+
+
 class Talker:
-    """PC mic → G.711 A-law 8 kHz → camera talk channel."""
+    """PC mic → IMA-ADPCM → camera talk channel."""
 
     def __init__(self):
         self.enabled = False
@@ -290,6 +358,10 @@ class Talker:
         self._client = None
         self._pcm = bytearray()
         self._ima = ImaEncoder()
+        self._out: queue.Queue[bytes] = queue.Queue(maxsize=40)
+        self._sender: threading.Thread | None = None
+        self._send_stop = threading.Event()
+        self._rate = 8000
         try:
             import sounddevice as sd
 
@@ -305,17 +377,80 @@ class Talker:
     def attach(self, client) -> None:
         self._client = client
 
+    def prepare(self) -> None:
+        """Open the mic once so Windows only prompts on first use."""
+        try:
+            self._open_mic()
+        except Exception:
+            pass
+
+    def _sender_loop(self) -> None:
+        while not self._send_stop.is_set():
+            try:
+                ima = self._out.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            client = self._client
+            if client is None or not self.enabled:
+                continue
+            try:
+                client.send_talk_audio(ima)
+            except Exception:
+                pass
+
+    def _ensure_sender(self) -> None:
+        if self._sender is not None and self._sender.is_alive():
+            return
+        self._send_stop.clear()
+        self._sender = threading.Thread(target=self._sender_loop, daemon=True, name="talk-send")
+        self._sender.start()
+
+    def _open_mic(self) -> None:
+        if self._sd is None:
+            raise RuntimeError("sounddevice is not installed")
+        _SHARED_MIC.add(self)
+        self._rate = _SHARED_MIC.rate
+        self._stream = _SHARED_MIC.stream
+
+    def _to_8k(self, pcm: bytes) -> bytes:
+        if self._rate == 8000:
+            return pcm
+        import array
+
+        src = array.array("h")
+        src.frombytes(pcm)
+        if not src:
+            return b""
+        step = self._rate / 8000.0
+        out = array.array("h")
+        i = 0.0
+        n = len(src)
+        while int(i) < n:
+            out.append(src[int(i)])
+            i += step
+        return out.tobytes()
+
     def _on_mic(self, indata, frames, time_info, status) -> None:
         if not self.enabled or self._client is None:
             return
         try:
-            self._pcm.extend(bytes(indata))
+            self._pcm.extend(self._to_8k(bytes(indata)))
             need = 1010
             while len(self._pcm) >= need:
                 block = bytes(self._pcm[:need])
                 del self._pcm[:need]
                 ima = self._ima.encode_block(block)
-                self._client.send_talk_audio(ima)
+                try:
+                    self._out.put_nowait(ima)
+                except queue.Full:
+                    try:
+                        self._out.get_nowait()
+                    except queue.Empty:
+                        pass
+                    try:
+                        self._out.put_nowait(ima)
+                    except queue.Full:
+                        pass
         except Exception:
             pass
 
@@ -327,42 +462,35 @@ class Talker:
         if self._client is None:
             self.error = "not connected"
             return False
-        if not self._client.start_talk():
+        ok = False
+        for _ in range(3):
+            try:
+                ok = bool(self._client.start_talk())
+            except Exception:
+                ok = False
+            if ok:
+                break
+            time.sleep(0.05)
+        if not ok:
             self.error = "camera rejected talk"
             return False
         try:
-            if self._stream is None:
-                kwargs = {
-                    "samplerate": 8000,
-                    "channels": 1,
-                    "dtype": "int16",
-                    "blocksize": 160,
-                    "callback": self._on_mic,
-                }
-                try:
-                    self._stream = self._sd.RawInputStream(**kwargs)
-                except Exception:
-                    kwargs["device"] = self._sd.default.device[0]
-                    self._stream = self._sd.RawInputStream(**kwargs)
-                self._stream.start()
+            self._open_mic()
+            self._ensure_sender()
             self._pcm.clear()
             self._ima.reset()
             self.enabled = True
             return True
         except Exception as exc:
             self.error = str(exc) or "microphone blocked"
-            self._client.stop_talk()
+            try:
+                self._client.stop_talk()
+            except Exception:
+                pass
             return False
 
     def stop(self) -> None:
         self.enabled = False
-        if self._stream is not None:
-            try:
-                self._stream.stop()
-                self._stream.close()
-            except Exception:
-                pass
-            self._stream = None
         if self._client is not None:
             try:
                 self._client.stop_talk()
@@ -371,9 +499,12 @@ class Talker:
 
     def close(self) -> None:
         self.stop()
+        self._send_stop.set()
+        _SHARED_MIC.remove(self)
+        self._stream = None
 
 
-ALERT_WAV = Path(__file__).with_name("audio") / "alert.wav"
+ALERT_WAV = AUDIO_DIR / "alert.wav"
 
 
 class AlertSiren:

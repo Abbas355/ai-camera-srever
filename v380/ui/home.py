@@ -8,10 +8,10 @@ from tkinter import messagebox, ttk
 
 from PIL import Image, ImageTk
 
-from auto_record import RecordSupervisor
-from camera_store import Camera, CameraStore
-from preview import PreviewManager
-from theme import ACCENT, BG, CARD, GREEN, MUTED, ORANGE, RED, TEXT, TILE
+from v380.record.auto_record import RecordSupervisor
+from v380.store.camera_store import Camera, CameraStore
+from v380.client.preview import PreviewManager
+from v380.ui.theme import ACCENT, BG, CARD, GREEN, MUTED, ORANGE, RED, TEXT, TILE
 
 
 def _fit_contain(img: Image.Image, box_w: int, box_h: int) -> Image.Image:
@@ -28,7 +28,7 @@ def _fit_contain(img: Image.Image, box_w: int, box_h: int) -> Image.Image:
 
 
 class HomeFrame(tk.Frame):
-    def __init__(self, master, store: CameraStore, recorders: RecordSupervisor, on_add, on_view, on_edit, on_clips=None):
+    def __init__(self, master, store: CameraStore, recorders: RecordSupervisor, on_add, on_view, on_edit, on_clips=None, previews=None):
         super().__init__(master, bg=BG)
         self.store = store
         self._recorders = recorders
@@ -37,7 +37,7 @@ class HomeFrame(tk.Frame):
         self._on_edit = on_edit
         self._on_clips = on_clips
         self._tiles: dict[int, _Tile] = {}
-        self._previews = PreviewManager(store, self._push_state)
+        self._previews = previews if previews is not None else PreviewManager(store, self._push_state)
         self._drain_on = True
         self._paused = False
 
@@ -230,7 +230,7 @@ class HomeFrame(tk.Frame):
         self._refresh_service_bar()
 
     def _delete(self, cam: Camera) -> None:
-        if not messagebox.askyesno("Delete camera", f"Remove {cam.name} ({cam.device_id}) from this PC?"):
+        if not messagebox.askyesno("Delete camera", f"Remove {cam.name} ({cam.device_id}) from the server?"):
             return
         self.store.delete(cam.id)
         self._recorders.sync(self.store.list())

@@ -13,12 +13,14 @@ from tkinter import messagebox, ttk
 
 from PIL import Image, ImageTk
 
-from camera_store import Camera
-from extras import AlawPlayer, AlertSiren, H264Recorder, Talker, discover_devices, get_relay_ip
-from theme import ACCENT, BG, CARD, GREEN, MUTED, ORANGE, RED, TEXT
-from v380_client import LiveH264Decoder, V380SnapshotClient
+from types import SimpleNamespace
 
-REC_DIR = Path(__file__).with_name("recordings")
+from v380.client.api_client import ApiTalkClient
+from v380.store.camera_store import Camera
+from v380.client.extras import AlawPlayer, AlertSiren, H264Recorder, Talker, discover_devices, get_relay_ip
+from v380.ui.theme import ACCENT, BG, CARD, GREEN, MUTED, ORANGE, RED, TEXT
+from v380.client.v380_client import LiveH264Decoder, V380SnapshotClient
+from v380.paths import REC_DIR
 
 
 class LiveView(tk.Frame):
@@ -30,6 +32,7 @@ class LiveView(tk.Frame):
         camera: Camera | None = None,
         auto_connect: bool = False,
         recorders=None,
+        api=None,
     ):
         super().__init__(master, bg=BG)
         self._on_back = on_back
@@ -37,11 +40,13 @@ class LiveView(tk.Frame):
         self._preset = camera
         self._auto_connect = auto_connect
         self._recorders = recorders
+        self._api = api
+        self._cam_id = camera.id if camera is not None else 0
 
         self._client: V380SnapshotClient | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        self._frames: queue.Queue[bytes] = queue.Queue(maxsize=3)
+        self._frames: queue.Queue[bytes] = queue.Queue(maxsize=2)
         self._decoder: LiveH264Decoder | None = None
         self._player = AlawPlayer()
         self._talker = Talker()
@@ -59,13 +64,29 @@ class LiveView(tk.Frame):
         self._alive = True
         self._view_zoom = 1.0
         self._alert_job = None
+        self._jobs: queue.Queue = queue.Queue()
+        threading.Thread(target=self._job_loop, daemon=True, name="live-jobs").start()
 
         self._build()
         if camera is not None:
             self._apply_camera(camera)
         self.after(16, self._drain_frames)
+        self.after(400, self._talker.prepare)
         if auto_connect and camera is not None:
             self.after(200, self._connect)
+
+    def _job_loop(self) -> None:
+        while True:
+            fn = self._jobs.get()
+            if fn is None:
+                break
+            try:
+                fn()
+            except Exception:
+                pass
+
+    def _bg(self, fn) -> None:
+        self._jobs.put(fn)
 
     def _ui(self, fn) -> None:
         if not self._alive:
@@ -283,7 +304,11 @@ class LiveView(tk.Frame):
 
         def work():
             try:
-                devs = discover_devices()
+                if self._api is not None:
+                    raw = self._api.discover()
+                    devs = [SimpleNamespace(mac=d.get("mac") or "", dev_id=str(d.get("device_id") or ""), ip=d.get("ip") or "") for d in raw]
+                else:
+                    devs = discover_devices()
             except Exception as exc:
                 self._ui( lambda: self._set_status(f"Discover failed: {exc}"))
                 return
@@ -318,6 +343,19 @@ class LiveView(tk.Frame):
         self._pending_mac = d.mac
 
     def _cmd(self, name: str) -> None:
+        if self._api is not None and self._cam_id:
+            cam_id = self._cam_id
+            if name != "ptz_stop":
+                self._set_status(f"{name.replace('_', ' ')}")
+            def work() -> None:
+                try:
+                    ok = self._api.command(cam_id, name)
+                    if name != "ptz_stop":
+                        self._ui(lambda: self._set_status(f"Sent {name.replace('_', ' ')}" if ok else f"Control failed: {name}"))
+                except Exception as exc:
+                    self._ui(lambda: self._set_status(f"Control failed: {exc}"))
+            self._bg(work)
+            return
         client = self._client
         if client is None:
             self._set_status("Connect first, then use controls")
@@ -326,6 +364,17 @@ class LiveView(tk.Frame):
         self._set_status(f"Sent {name.replace('_', ' ')}" if ok else f"Control failed: {name}")
 
     def _alert_on(self) -> None:
+        if self._api is not None and self._cam_id:
+            cam_id = self._cam_id
+            self._set_status("Alert ON")
+            if self._alert_job is not None:
+                try:
+                    self.after_cancel(self._alert_job)
+                except Exception:
+                    pass
+            self._alert_job = self.after(20000, self._alert_auto_off)
+            self._bg(lambda: self._api.alert(cam_id, True))
+            return
         if self._client is None:
             self._set_status("Connect first, then Alert")
             return
@@ -351,12 +400,18 @@ class LiveView(tk.Frame):
             except Exception:
                 pass
             self._alert_job = None
+        if self._api is not None and self._cam_id:
+            cam_id = self._cam_id
+            self._bg(lambda: self._api.alert(cam_id, False))
         self._alert.stop()
         self._set_status("Alert off")
 
     def _alert_auto_off(self) -> None:
         self._alert_job = None
         if self._alive:
+            if self._api is not None and self._cam_id:
+                cam_id = self._cam_id
+                self._bg(lambda: self._api.alert(cam_id, False))
             self._alert.stop()
             self._set_status("Alert off")
 
@@ -386,34 +441,42 @@ class LiveView(tk.Frame):
 
     def _toggle_talk(self) -> None:
         if self._talker.enabled:
-            self._talker.stop()
+            self._talker.enabled = False
+            self._bg(self._talker.stop)
             self.talk_btn.configure(text="Talk OFF", bg="#334155")
             self._set_status("Talk off")
             return
-        if self._client is None:
+        if self._api is not None and self._cam_id:
+            self._talker.attach(ApiTalkClient(self._api, self._cam_id))
+        elif self._client is None:
             self._set_status("Connect first, then Talk")
             return
-        self._talker.attach(self._client)
-        if self._talker.start():
-            self.talk_btn.configure(text="Talk ON", bg=GREEN)
-            self._set_status("Talk ON — speak into the PC microphone")
         else:
-            self.talk_btn.configure(text="Talk OFF", bg="#334155")
+            self._talker.attach(self._client)
+        self.talk_btn.configure(text="Talk ON", bg=GREEN)
+        self._set_status("Talk ON — speak into the PC microphone")
+        def work() -> None:
+            if self._talker.start():
+                return
             err = self._talker.error or "unknown error"
-            self._set_status(f"Talk failed — {err}")
-            if "microphone" in err.lower() or "invalid" in err.lower() or "device" in err.lower():
-                open_settings = messagebox.askyesno(
-                    "Microphone blocked",
-                    "Windows is blocking the microphone, so there is no Allow button in this app.\n\n"
-                    "Turn ON both of these:\n"
-                    "• Microphone access\n"
-                    "• Let desktop apps access your microphone\n\n"
-                    "Open Windows microphone settings now?",
-                )
-                if open_settings:
-                    Talker.open_mic_settings()
-            else:
-                messagebox.showerror("Talk failed", err)
+            def fail() -> None:
+                self.talk_btn.configure(text="Talk OFF", bg="#334155")
+                self._set_status(f"Talk failed — {err}")
+                low = err.lower()
+                if any(w in low for w in ("blocked", "denied", "privacy", "access is denied")):
+                    if messagebox.askyesno(
+                        "Microphone blocked",
+                        "Windows is blocking the microphone, so there is no Allow button in this app.\n\n"
+                        "Turn ON both of these:\n"
+                        "• Microphone access\n"
+                        "• Let desktop apps access your microphone\n\n"
+                        "Open Windows microphone settings now?",
+                    ):
+                        Talker.open_mic_settings()
+                else:
+                    messagebox.showerror("Talk failed", err)
+            self._ui(fail)
+        self._bg(work)
 
     def _snapshot(self) -> None:
         if not self._last_jpeg:
@@ -467,6 +530,9 @@ class LiveView(tk.Frame):
         self._set_status(f"Connecting ({source.upper()} {quality_name}) …")
 
         def worker() -> None:
+            if self._api is not None:
+                self._connect_remote(fields)
+                return
             while not self._stop.is_set():
                 client = None
                 decoder = None
@@ -532,17 +598,112 @@ class LiveView(tk.Frame):
                         client.close()
                     if self._client is client:
                         self._client = None
-            if not self._stop.is_set() and self._alive:
-                self._ui( lambda: self.connect_btn.configure(text="Connect", bg=ACCENT))
 
         self._thread = threading.Thread(target=worker, daemon=True)
         self._thread.start()
+
+    def _connect_remote(self, fields: dict) -> None:
+        try:
+            if not self._cam_id and self._on_connected is not None:
+                saved = self._on_connected(fields)
+                self._cam_id = int(getattr(saved, "id", 0) or 0)
+            if not self._cam_id:
+                raise RuntimeError("Camera was not saved on the server")
+            self._ui(lambda: self._set_status("Live from server…"))
+            self._pump_stream(self._cam_id)
+        except Exception as exc:
+            if not self._stop.is_set():
+                self._ui(lambda m=str(exc): self._fail(m))
+        finally:
+            if not self._stop.is_set() and self._alive:
+                self._ui(lambda: self.connect_btn.configure(text="Connect", bg=ACCENT))
+
+    def _push_jpeg(self, jpeg: bytes) -> None:
+        if not jpeg:
+            return
+        self._last_jpeg = jpeg
+        try:
+            self._frames.put_nowait(jpeg)
+        except queue.Full:
+            try:
+                self._frames.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._frames.put_nowait(jpeg)
+            except queue.Full:
+                pass
+
+    def _pump_h264(self, cam_id: int) -> bool:
+        try:
+            resp = self._api.open_h264(cam_id)
+        except Exception:
+            return False
+        decoder = None
+        try:
+            for kind, a, b in self._api.iter_h264(resp):
+                if self._stop.is_set():
+                    break
+                if kind == "codec":
+                    if decoder is not None:
+                        decoder.close()
+                    decoder = LiveH264Decoder(self._frames, fmt=str(a), scale_width=0, jpeg_q=3, threads=2)
+                    self._decoder = decoder
+                    label = "H.265" if a == "hevc" else "H.264"
+                    self._ui(lambda c=label: self._set_codec(c))
+                    continue
+                if decoder is None:
+                    decoder = LiveH264Decoder(self._frames, fmt="h264", scale_width=0, jpeg_q=3, threads=2)
+                    self._decoder = decoder
+                decoder.write_frame(bool(a), b, None, None, None)
+            return True
+        except Exception:
+            return False
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+            if decoder is not None:
+                decoder.close()
+                if self._decoder is decoder:
+                    self._decoder = None
+
+    def _pump_stream(self, cam_id: int) -> None:
+        while not self._stop.is_set():
+            if self._pump_h264(cam_id):
+                if self._stop.is_set():
+                    break
+                time.sleep(0.05)
+                continue
+            try:
+                resp = self._api.open_mjpeg(cam_id)
+            except Exception:
+                jpeg = self._api.snapshot(cam_id)
+                if jpeg:
+                    self._push_jpeg(jpeg)
+                time.sleep(0.04)
+                continue
+            try:
+                for jpeg in self._api.iter_mjpeg(resp):
+                    if self._stop.is_set():
+                        break
+                    self._push_jpeg(jpeg)
+            except Exception:
+                if self._stop.is_set():
+                    break
+                time.sleep(0.05)
+            finally:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
 
     def _fail(self, msg: str) -> None:
         self._stop.set()
         self.connect_btn.configure(text="Connect", bg=ACCENT)
         self._set_status(f"Error: {msg}")
-        messagebox.showerror("Login failed", msg)
+        messagebox.showerror("Live", msg)
 
     def _disconnect(self) -> None:
         self._stop.set()
@@ -605,7 +766,7 @@ class LiveView(tk.Frame):
         except Exception:
             pass
         if self._alive:
-            self.after(50, self._drain_frames)
+            self.after(16, self._drain_frames)
 
     def go_back(self) -> None:
         self.shutdown()
@@ -614,6 +775,7 @@ class LiveView(tk.Frame):
     def shutdown(self) -> None:
         self._alive = False
         self._stop.set()
+        self._jobs.put(None)
         if self._recorder.active:
             self._recorder.stop()
         if self._client is not None:

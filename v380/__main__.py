@@ -1,5 +1,3 @@
-"""Windows launcher for V380 Studio."""
-
 from v380.ui.app import main
 
 if __name__ == "__main__":

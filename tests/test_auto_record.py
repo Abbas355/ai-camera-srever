@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
-from auto_record import (
+from v380.record.auto_record import (
     AutoRecordManager,
     RecordSupervisor,
     _ChunkWriter,
@@ -28,8 +28,8 @@ from auto_record import (
     should_leave_raw,
     write_worker_status,
 )
-from camera_store import Camera, CameraStore
-from db import connect
+from v380.store.camera_store import Camera, CameraStore
+from v380.store.db import connect
 
 
 def _cam(
@@ -231,7 +231,7 @@ class WriterTests(unittest.TestCase):
         w1.feed(now, "h264", True, b"AAA")
         w1._fh.close()
         w1._fh = None
-        _mark = __import__("auto_record", fromlist=["_mark_open"])._mark_open
+        _mark = __import__("v380.record.auto_record", fromlist=["_mark_open"])._mark_open
         _mark(w1._raw, False)
         w2 = _ChunkWriter(self.cam, self.td, remux=_fake_remux)
         w2.feed(now.replace(minute=37), "h264", True, b"BBB")
@@ -320,7 +320,7 @@ class WriterTests(unittest.TestCase):
         day.mkdir(parents=True)
         raw = day / "11-00-00.h264"
         raw.write_bytes(b"leftover")
-        with mock.patch("auto_record.remux_annexb", _fake_remux):
+        with mock.patch("v380.record.auto_record.remux_annexb", _fake_remux):
             self.assertEqual(remux_orphans(self.td, datetime(2026, 8, 17, 14, 0)), 1)
         self.assertTrue((day / "11-00-00.mp4").exists())
         self.assertFalse(raw.exists())
@@ -330,7 +330,7 @@ class WriterTests(unittest.TestCase):
         day.mkdir(parents=True)
         raw = day / "14-00-00.h264"
         raw.write_bytes(b"live")
-        with mock.patch("auto_record.remux_annexb", _fake_remux):
+        with mock.patch("v380.record.auto_record.remux_annexb", _fake_remux):
             self.assertEqual(remux_orphans(self.td, datetime(2026, 8, 17, 14, 37)), 0)
         self.assertTrue(raw.exists())
         self.assertFalse((day / "14-00-00.mp4").exists())
@@ -338,7 +338,7 @@ class WriterTests(unittest.TestCase):
     def test_orphan_skips_manual_rec_file(self):
         rec = self.td / "rec_20260817_140000.h264"
         rec.write_bytes(b"manual")
-        with mock.patch("auto_record.remux_annexb", _fake_remux):
+        with mock.patch("v380.record.auto_record.remux_annexb", _fake_remux):
             self.assertEqual(remux_orphans(self.td, datetime(2026, 8, 17, 14, 1)), 0)
         self.assertTrue(rec.exists())
 
@@ -411,8 +411,8 @@ class ManagerTests(unittest.TestCase):
         td = Path(tempfile.mkdtemp())
         mgr = AutoRecordManager(td)
         cam = _cam(5, ip="192.168.1.7")
-        with mock.patch("auto_record.V380SnapshotClient", _FakeClient), mock.patch(
-            "auto_record.remux_annexb", _fake_remux
+        with mock.patch("v380.record.auto_record.V380SnapshotClient", _FakeClient), mock.patch(
+            "v380.record.auto_record.remux_annexb", _fake_remux
         ):
             mgr.sync([cam])
             time.sleep(0.15)
@@ -430,8 +430,8 @@ class ManagerTests(unittest.TestCase):
         td = Path(tempfile.mkdtemp())
         mgr = AutoRecordManager(td)
         cam = _cam(6)
-        with mock.patch("auto_record.V380SnapshotClient", _FakeClient), mock.patch(
-            "auto_record.remux_annexb", _fake_remux
+        with mock.patch("v380.record.auto_record.V380SnapshotClient", _FakeClient), mock.patch(
+            "v380.record.auto_record.remux_annexb", _fake_remux
         ):
             mgr.sync([cam])
             time.sleep(0.15)
@@ -447,8 +447,8 @@ class ManagerTests(unittest.TestCase):
         td = Path(tempfile.mkdtemp())
         mgr = AutoRecordManager(td)
         cam = _cam(9)
-        with mock.patch("auto_record.V380SnapshotClient", _FakeClient), mock.patch(
-            "auto_record.remux_annexb", _fake_remux
+        with mock.patch("v380.record.auto_record.V380SnapshotClient", _FakeClient), mock.patch(
+            "v380.record.auto_record.remux_annexb", _fake_remux
         ):
             mgr.sync([cam])
             time.sleep(0.15)
@@ -493,7 +493,7 @@ class SupervisorTests(unittest.TestCase):
 
     def test_sync_starts_worker_only_when_enabled(self):
         sup = RecordSupervisor(self.td)
-        with mock.patch("auto_record.ensure_worker") as ensure, mock.patch("auto_record._sync_logon_task") as task:
+        with mock.patch("v380.record.auto_record.ensure_worker") as ensure, mock.patch("v380.record.auto_record._sync_logon_task") as task:
             sup.sync([_cam(1, auto_record=False)])
             time.sleep(0.05)
             ensure.assert_not_called()
@@ -516,14 +516,14 @@ class SupervisorTests(unittest.TestCase):
 
     def test_ensure_worker_skips_spawn_when_alive(self):
         write_worker_status(self.td, {"pid": 1, "heartbeat": time.time()})
-        with mock.patch("auto_record._start_worker_process") as start:
+        with mock.patch("v380.record.auto_record._start_worker_process") as start:
             self.assertTrue(ensure_worker(self.td))
             start.assert_not_called()
 
     def test_gui_does_not_write_local_files(self):
         cam = _cam(3)
         sup = RecordSupervisor(self.td, self.td)
-        with mock.patch("auto_record.ensure_worker"), mock.patch("auto_record._sync_logon_task"):
+        with mock.patch("v380.record.auto_record.ensure_worker"), mock.patch("v380.record.auto_record._sync_logon_task"):
             sup.sync([cam])
         client = _FakeClient()
         sup.on_video(cam, True, b"\x00\x00\x00\x01Ixxxx", client)
@@ -531,7 +531,7 @@ class SupervisorTests(unittest.TestCase):
         self.assertFalse(sup.is_recording(3))
         write_worker_status(self.td, {"pid": 1, "heartbeat": time.time(), "recording": {"3": True}})
         self.assertTrue(sup.is_recording(3))
-        with mock.patch("auto_record.ensure_worker") as ensure, mock.patch("auto_record._sync_logon_task"):
+        with mock.patch("v380.record.auto_record.ensure_worker") as ensure, mock.patch("v380.record.auto_record._sync_logon_task"):
             sup.release_to_worker()
             time.sleep(0.05)
             ensure.assert_called()
@@ -548,7 +548,7 @@ class SupervisorTests(unittest.TestCase):
             Path(dst).write_text(Path(src).read_text(encoding="utf-8"), encoding="utf-8")
             Path(src).unlink(missing_ok=True)
 
-        with mock.patch("auto_record.os.replace", flaky_replace):
+        with mock.patch("v380.record.auto_record.os.replace", flaky_replace):
             write_worker_status(self.td, {"pid": 4, "heartbeat": time.time(), "recording": {}})
         self.assertTrue(path.exists())
 

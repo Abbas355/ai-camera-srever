@@ -7,9 +7,9 @@ import threading
 import time
 from collections.abc import Callable
 
-from camera_store import Camera, CameraStore
-from extras import get_relay_ip
-from v380_client import LiveH264Decoder, V380SnapshotClient
+from v380.store.camera_store import Camera, CameraStore
+from v380.client.extras import get_relay_ip
+from v380.client.v380_client import LiveH264Decoder, V380SnapshotClient
 
 OnState = Callable[[int, str], None]
 

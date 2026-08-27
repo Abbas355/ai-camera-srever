@@ -7,7 +7,7 @@ import struct
 import sys
 import time
 
-from v380_client import (
+from v380.client.v380_client import (
     _ru16,
     _ru32,
     _u16,

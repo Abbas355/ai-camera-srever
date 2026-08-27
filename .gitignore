@@ -1,5 +1,20 @@
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.pyo
+.Python
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Runtime data (db, keys, worker state, last server IP)
 data/*.db
 data/*.db-journal
 data/*.db-wal
@@ -10,5 +25,31 @@ data/record_worker.json
 data/record_worker.json.tmp
 data/record_worker.log
 data/studio.lease
+data/server.txt
+data/clip_cache/
+
+# Camera recordings
 recordings/
+
+# Snapshots / debug captures
 last_snapshot.jpg
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Inno Setup output (keep the .iss script)
+installer/*.exe
+installer/Output/
+
+# Linux package dumps
+*.tar.gz
+
+# OS / editor
+.DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/
+*.swp

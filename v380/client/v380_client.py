@@ -781,6 +781,8 @@ class LiveH264Decoder:
             probe,
             "-analyzeduration",
             "0",
+            "-vsync",
+            "0",
         ]
         if threads is not None:
             cmd.extend(["-threads", str(threads)])
@@ -798,7 +800,7 @@ class LiveH264Decoder:
         self.proc = subprocess.Popen(cmd, **popen_kw)
         self._queue = out_queue
         self._stop = threading.Event()
-        self._in_q: queue.Queue = queue.Queue(maxsize=8)
+        self._in_q: queue.Queue = queue.Queue(maxsize=2)
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._writer = threading.Thread(target=self._write_loop, daemon=True)
         self._reader.start()
@@ -813,11 +815,11 @@ class LiveH264Decoder:
         vps: bytes | None = None,
     ) -> None:
         item = (is_iframe, payload, sps, pps, vps)
-        if self._in_q.full():
+        while True:
             try:
                 self._in_q.get_nowait()
             except queue.Empty:
-                pass
+                break
         try:
             self._in_q.put_nowait(item)
         except queue.Full:
@@ -956,3 +958,33 @@ def _decode_ffmpeg(h264: bytes, fmt: str = "h264") -> bytes | None:
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return None
     return proc.stdout if proc.stdout else None
+
+
+_g = globals()
+for _a, _b in (
+    ("V380SnapshotClient", "V380SnapshotClient"),
+    ("LiveH264Decoder", "LiveH264Decoder"),
+):
+    if _a in _g and _b not in _g:
+        _g[_b] = _g[_a]
+    if _b in _g and _a not in _g:
+        _g[_a] = _g[_b]
+_cls = _g.get("V380SnapshotClient") or _g.get("V380SnapshotClient")
+if _cls is not None:
+    for _a, _b in (
+        ("send_control", "send_control"),
+        ("iter_video_frames", "iter_video_frames"),
+        ("h264_for_decode", "h264_for_decode"),
+        ("start_talk", "start_talk"),
+        ("send_talk_audio", "send_talk_audio"),
+        ("stop_talk", "stop_talk"),
+    ):
+        if hasattr(_cls, _a) and not hasattr(_cls, _b):
+            setattr(_cls, _b, getattr(_cls, _a))
+        if hasattr(_cls, _b) and not hasattr(_cls, _a):
+            setattr(_cls, _a, getattr(_cls, _b))
+_dec = _g.get("LiveH264Decoder") or _g.get("LiveH264Decoder")
+if _dec is not None and hasattr(_dec, "write_frame") and not hasattr(_dec, "write_frame"):
+    _dec.write_frame = _dec.write_frame
+if _dec is not None and hasattr(_dec, "write_frame") and not hasattr(_dec, "write_frame"):
+    _dec.write_frame = _dec.write_frame

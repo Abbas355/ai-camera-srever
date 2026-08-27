@@ -37,6 +37,14 @@ CREATE TABLE IF NOT EXISTS camera_status (
 );
 
 CREATE INDEX IF NOT EXISTS idx_cameras_device_id ON cameras(device_id);
+
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL UNIQUE,
+    pass_salt BLOB NOT NULL,
+    pass_hash BLOB NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 

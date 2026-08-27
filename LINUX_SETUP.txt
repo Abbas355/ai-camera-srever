@@ -1,0 +1,41 @@
+Linux studio + Windows UI
+==========================
+
+Linux (this PC) is the real software:
+- login
+- cameras
+- live
+- talk
+- alert
+- record
+- old clips
+
+Windows is only the screen.
+
+First login (created automatically on the server)
+  username: admin
+  password: 1290
+
+On Windows
+1. Run run.bat
+2. Server IP: 192.168.1.68
+3. Connect
+4. Sign in: admin / 1290
+5. Add camera / Rec / Recordings all go to Linux
+
+Do not open a browser. Do not change nginx, MySQL, or ports 22 / 8000 / 8081.
+
+Linux services (already installed under /home/amf/v380-studio)
+  systemctl --user status v380-record
+  systemctl --user status v380-clips
+
+Code layout on disk:
+  v380/ui        Windows screens
+  v380/client    camera protocol + HTTP client
+  v380/store     database
+  v380/record     auto-record
+  v380/server     Linux API
+  data/          db and keys
+  recordings/    clips
+
+v380-clips now runs the full studio API on port 8080.

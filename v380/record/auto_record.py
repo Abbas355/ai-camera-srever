@@ -16,14 +16,27 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
-from camera_store import Camera, CameraStore
-from extras import get_relay_ip, remux_annexb
-from v380_client import V380SnapshotClient
+REC_TZ_NAME = os.environ.get("V380_TZ", "Asia/Karachi")
 
-REC_DIR = Path(__file__).with_name("recordings")
+
+def _tz():
+    try:
+        return ZoneInfo(REC_TZ_NAME)
+    except Exception:
+        return timezone(timedelta(hours=5))
+
+
+def _now() -> datetime:
+    return datetime.now(_tz())
+
+from v380.client.extras import get_relay_ip, remux_annexb
+from v380.client.v380_client import V380SnapshotClient
+from v380.paths import DATA_DIR, REC_DIR, ROOT as APP_DIR, WORKER_SCRIPT
+from v380.store.camera_store import Camera, CameraStore
 _WIN_BAD = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _RESERVED = {"CON", "PRN", "AUX", "NUL"} | {f"{p}{i}" for p in ("COM", "LPT") for i in range(10)}
 _FOLDER_LOCK = threading.Lock()
@@ -144,7 +157,7 @@ def _chunk_raw_path(folder: Path, day: str, hour: str, minute: str | None, fmt: 
 
 def is_current_slot(path: Path, now: datetime | None = None) -> bool:
     """True if this raw file is the still-open clock slot (must stay .h264)."""
-    now = now or datetime.now()
+    now = now or _now()
     day = now.strftime("%Y-%m-%d")
     hour = now.strftime("%H")
     minute = now.strftime("%M")
@@ -175,7 +188,7 @@ def rename_legacy_names(root: Path | None = None) -> int:
     root = root or REC_DIR
     if not root.exists():
         return 0
-    clock = datetime.now()
+    clock = _now()
     done = 0
     for path in list(root.rglob("*")):
         if not path.is_file() or path.suffix.lower() not in (".mp4", ".h264", ".h265"):
@@ -231,7 +244,7 @@ def remux_orphans(rec_dir: Path | None, now: datetime | None = None) -> int:
     if not root.exists():
         return 0
     rename_legacy_names(root)
-    clock = now or datetime.now()
+    clock = now or _now()
     done = 0
     for ext, fmt in ((".h264", "h264"), (".h265", "hevc")):
         for path in root.rglob(f"*{ext}"):
@@ -311,7 +324,7 @@ class _ChunkWriter:
         self._fh = None
         self._raw: Path | None = None
         self._fmt = "h264"
-        self._until = datetime.now()
+        self._until = _now()
         self._bytes = 0
 
     def feed(self, now: datetime, fmt: str, is_iframe: bool, annexb: bytes) -> None:
@@ -478,7 +491,7 @@ class AutoRecordManager:
                             continue
                         need_key = False
                         rec = client.h264_for_decode(payload) if is_iframe else payload
-                        writer.feed(datetime.now(), client.video_codec, bool(is_iframe), rec)
+                        writer.feed(_now(), client.video_codec, bool(is_iframe), rec)
                         self._alive[cam.id] = True
                 except Exception as exc:
                     self._alive[cam.id] = False
@@ -502,8 +515,6 @@ class AutoRecordManager:
                     self._threads.pop(cam.id, None)
 
 
-APP_DIR = Path(__file__).resolve().parent
-DATA_DIR = APP_DIR / "data"
 TASK_NAME = "V380StudioAutoRecord"
 WATCH_TASK_NAME = "V380StudioAutoRecordWatch"
 _MUTEX_HANDLE = None
@@ -541,12 +552,12 @@ def _python_exe() -> str:
 
 
 def _worker_script() -> Path:
-    return APP_DIR / "record_worker.py"
+    return WORKER_SCRIPT
 
 
 def _log(data_dir: Path, message: str) -> None:
     path = data_dir / "record_worker.log"
-    line = f"{datetime.now().isoformat(timespec='seconds')} {message}\n"
+    line = f"{_now().isoformat(timespec='seconds')} {message}\n"
     try:
         data_dir.mkdir(parents=True, exist_ok=True)
         if path.exists() and path.stat().st_size > 1_000_000:
