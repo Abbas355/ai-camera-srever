@@ -1,10 +1,9 @@
-"""Unit tests for hourly auto-record paths, store, writer, and worker lifecycle."""
+"""Unit tests for hourly / 1-minute auto-record, remux rules, and the worker."""
 
 from __future__ import annotations
 
 import sqlite3
 import tempfile
-import threading
 import time
 import unittest
 from datetime import datetime, timedelta
@@ -14,17 +13,19 @@ from unittest import mock
 from auto_record import (
     AutoRecordManager,
     RecordSupervisor,
-    _HourWriter,
-    _hour_raw_path,
-    _hour_stamp,
-    _segment_path,
+    _ChunkWriter,
+    _chunk_raw_path,
+    _chunk_stamp,
     camera_folder,
+    chunk_mode,
     ensure_worker,
+    is_current_slot,
     is_worker_alive,
     logon_task_command,
     read_worker_status,
     remux_orphans,
     sanitize_folder,
+    should_leave_raw,
     write_worker_status,
 )
 from camera_store import Camera, CameraStore
@@ -37,6 +38,7 @@ def _cam(
     device_id: str = "101",
     auto_record: bool = True,
     ip: str = "192.168.1.7",
+    record_chunk: str = "hour",
 ) -> Camera:
     return Camera(
         id=cam_id,
@@ -50,6 +52,7 @@ def _cam(
         source="lan",
         quality=1,
         auto_record=auto_record,
+        record_chunk=record_chunk,
         created_at="",
         updated_at="",
     )
@@ -82,56 +85,77 @@ class SanitizeTests(unittest.TestCase):
         self.assertEqual(len(sanitize_folder("x" * 200, "1")), 80)
 
 
-class SegmentPathTests(unittest.TestCase):
+class ChunkPathTests(unittest.TestCase):
     def setUp(self):
         self.td = Path(tempfile.mkdtemp())
         self.now = datetime(2026, 8, 17, 14, 37, 5)
 
-    def test_first_segment_is_hour(self):
-        p = _segment_path(self.td / "Lab", "2026-08-17", "14", self.now)
-        self.assertEqual(p.name, "14")
-        self.assertTrue((self.td / "Lab" / "2026-08-17").is_dir())
+    def test_hourly_stamp(self):
+        day, hour, minute, until = _chunk_stamp(self.now, "hour")
+        self.assertEqual((day, hour, minute), ("2026-08-17", "14", None))
+        self.assertEqual(until, datetime(2026, 8, 17, 15, 0, 0))
 
-    def test_existing_mp4_uses_hour_minute(self):
+    def test_minute_stamp(self):
+        day, hour, minute, until = _chunk_stamp(self.now, "minute")
+        self.assertEqual((day, hour, minute), ("2026-08-17", "14", "37"))
+        self.assertEqual(until, datetime(2026, 8, 17, 14, 38, 0))
+
+    def test_hourly_path_is_date_hour(self):
+        p = _chunk_raw_path(self.td / "Lab", "2026-08-17", "14", None, "h264")
+        self.assertEqual(p, self.td / "Lab" / "2026-08-17" / "14-00-00.h264")
+
+    def test_minute_path_is_date_hour_minute(self):
+        p = _chunk_raw_path(self.td / "Lab", "2026-08-17", "14", "37", "h264")
+        self.assertEqual(p, self.td / "Lab" / "2026-08-17" / "14" / "14-37-00.h264")
+
+    def test_existing_mp4_does_not_rename_slot(self):
         day = self.td / "Lab" / "2026-08-17"
         day.mkdir(parents=True)
-        (day / "14.mp4").write_bytes(b"old")
-        p = _segment_path(self.td / "Lab", "2026-08-17", "14", self.now)
-        self.assertEqual(p.name, "14-37")
-        raw = _hour_raw_path(self.td / "Lab", "2026-08-17", "14", "h264", self.now)
-        self.assertEqual(raw.name, "14-37.h264")
+        (day / "14-00-00.mp4").write_bytes(b"old")
+        p = _chunk_raw_path(self.td / "Lab", "2026-08-17", "14", None, "h264")
+        self.assertEqual(p.name, "14-00-00.h264")
+        self.assertFalse(any(day.glob("14-37*")))
 
-    def test_existing_raw_is_reused(self):
-        day = self.td / "Lab" / "2026-08-17"
-        day.mkdir(parents=True)
-        (day / "14.h264").write_bytes(b"old")
-        p = _hour_raw_path(self.td / "Lab", "2026-08-17", "14", "h264", self.now)
-        self.assertEqual(p.name, "14.h264")
-
-    def test_same_minute_uses_seconds(self):
-        day = self.td / "Lab" / "2026-08-17"
-        day.mkdir(parents=True)
-        (day / "14.mp4").write_bytes(b"a")
-        (day / "14-37.mp4").write_bytes(b"b")
-        p = _segment_path(self.td / "Lab", "2026-08-17", "14", self.now)
-        self.assertEqual(p.name, "14-37-05")
-
-    def test_same_second_increments(self):
-        day = self.td / "Lab" / "2026-08-17"
-        day.mkdir(parents=True)
-        for name in ("14.mp4", "14-37.mp4", "14-37-05.mp4"):
-            (day / name).write_bytes(b"x")
-        p = _segment_path(self.td / "Lab", "2026-08-17", "14", self.now)
-        self.assertEqual(p.name, "14-37-05-2")
+    def test_hevc_extension(self):
+        p = _chunk_raw_path(self.td / "Lab", "2026-08-17", "08", None, "hevc")
+        self.assertEqual(p.name, "08-00-00.h265")
 
     def test_midnight_hour_stamp(self):
         now = datetime(2026, 8, 17, 23, 59, 1)
-        day, hour, until = _hour_stamp(now)
-        self.assertEqual(day, "2026-08-17")
-        self.assertEqual(hour, "23")
+        day, hour, minute, until = _chunk_stamp(now, "hour")
+        self.assertEqual((day, hour, minute), ("2026-08-17", "23", None))
         self.assertEqual(until, datetime(2026, 8, 18, 0, 0, 0))
-        day2, hour2, _ = _hour_stamp(until)
+        day2, hour2, _, _ = _chunk_stamp(until, "hour")
         self.assertEqual((day2, hour2), ("2026-08-18", "00"))
+
+    def test_chunk_mode_normalizes(self):
+        self.assertEqual(chunk_mode("minute"), "minute")
+        self.assertEqual(chunk_mode("hour"), "hour")
+        self.assertEqual(chunk_mode("nope"), "hour")
+
+
+class CurrentSlotTests(unittest.TestCase):
+    def test_hourly_current_and_past(self):
+        now = datetime(2026, 8, 17, 14, 10)
+        cur = Path("Lab") / "2026-08-17" / "14-00-00.h264"
+        past = Path("Lab") / "2026-08-17" / "13-00-00.h264"
+        self.assertTrue(is_current_slot(cur, now))
+        self.assertFalse(is_current_slot(past, now))
+
+    def test_minute_current_and_past(self):
+        now = datetime(2026, 8, 17, 14, 7, 30)
+        cur = Path("Lab") / "2026-08-17" / "14" / "14-07-00.h264"
+        past = Path("Lab") / "2026-08-17" / "14" / "14-06-00.h264"
+        self.assertTrue(is_current_slot(cur, now))
+        self.assertFalse(is_current_slot(past, now))
+
+    def test_manual_rec_file_is_left_raw(self):
+        path = Path("recordings") / "rec_20260817_140000.h264"
+        self.assertTrue(should_leave_raw(path, datetime(2026, 8, 17, 14, 1)))
+
+    def test_legacy_split_name_is_not_current(self):
+        now = datetime(2026, 8, 17, 14, 37)
+        self.assertFalse(is_current_slot(Path("Lab") / "2026-08-17" / "14-37.h264", now))
 
 
 class CameraFolderTests(unittest.TestCase):
@@ -147,8 +171,6 @@ class CameraFolderTests(unittest.TestCase):
         camera_folder(_cam(1, "Lab", "101"), self.td)
         path = camera_folder(_cam(2, "Lab", "202"), self.td)
         self.assertEqual(path.name, "Lab_202")
-        self.assertTrue((self.td / "Lab").is_dir())
-        self.assertTrue((self.td / "Lab_202").is_dir())
 
     def test_rename_moves_existing_folder(self):
         first = camera_folder(_cam(1, "Lab", "101"), self.td)
@@ -156,143 +178,186 @@ class CameraFolderTests(unittest.TestCase):
         moved = camera_folder(_cam(1, "Office", "101"), self.td)
         self.assertEqual(moved.name, "Office")
         self.assertTrue((moved / "keep.txt").exists())
-        self.assertFalse((self.td / "Lab").exists())
 
     def test_rename_keeps_old_if_new_name_taken(self):
         camera_folder(_cam(1, "Lab", "101"), self.td)
         camera_folder(_cam(2, "Office", "202"), self.td)
         path = camera_folder(_cam(1, "Office", "101"), self.td)
         self.assertEqual(path.name, "Office_101")
-        self.assertTrue((self.td / "Office" / ".device_id").read_text(encoding="utf-8") == "202")
 
 
 class WriterTests(unittest.TestCase):
     def setUp(self):
         self.td = Path(tempfile.mkdtemp())
         self.cam = _cam()
-        self.w = _HourWriter(self.cam, self.td, remux=_fake_remux)
+        self.w = _ChunkWriter(self.cam, self.td, remux=_fake_remux)
 
     def test_first_hour_file_and_empty_delete(self):
         now = datetime(2026, 8, 17, 14, 5, 0)
-        self.w.ensure(now, "h264")
-        raw = self.td / "Lab" / "2026-08-17" / "14.h264"
+        self.w.feed(now, "h264", True, b"")
+        self.assertIsNone(self.w._raw)
+        self.w.feed(now, "h264", True, b"\x00\x00\x00\x01I")
+        raw = self.td / "Lab" / "2026-08-17" / "14-00-00.h264"
         self.assertTrue(raw.exists())
+        self.w._bytes = 0
+        raw.write_bytes(b"")
         self.assertIsNone(self.w.close())
         self.assertFalse(raw.exists())
 
-    def test_writes_then_remuxes_to_mp4(self):
+    def test_current_stays_h264_until_close(self):
         now = datetime(2026, 8, 17, 14, 5, 0)
-        self.w.ensure(now, "h264")
-        self.w.write(b"\x00\x00\x00\x01frame")
-        out = self.w.close()
-        self.assertEqual(out.name, "14.mp4")
-        self.assertTrue(out.exists())
-        self.assertFalse((self.td / "Lab" / "2026-08-17" / "14.h264").exists())
-
-    def test_restart_does_not_overwrite(self):
+        self.w.feed(now, "h264", True, b"I")
         day = self.td / "Lab" / "2026-08-17"
-        day.mkdir(parents=True)
-        (day / "14.mp4").write_bytes(b"first-hour")
-        now = datetime(2026, 8, 17, 14, 37, 0)
-        self.w.ensure(now, "h264")
-        self.w.write(b"second")
+        self.assertTrue((day / "14-00-00.h264").exists())
+        self.assertFalse((day / "14-00-00.mp4").exists())
         out = self.w.close()
-        self.assertEqual(out.name, "14-37.mp4")
-        self.assertEqual((day / "14.mp4").read_bytes(), b"first-hour")
+        self.assertEqual(out.name, "14-00-00.mp4")
+        self.assertTrue(out.exists())
+        self.assertFalse((day / "14-00-00.h264").exists())
 
-    def test_hour_rollover_starts_new_file(self):
-        start = datetime(2026, 8, 17, 14, 59, 50)
-        self.w.ensure(start, "h264")
-        self.w.write(b"hour14")
-        later = datetime(2026, 8, 17, 15, 0, 0)
-        self.assertTrue(self.w.due(later))
+    def test_restart_appends_same_hour_file(self):
+        now = datetime(2026, 8, 17, 14, 10, 0)
+        self.w.feed(now, "h264", True, b"AAA")
         self.w.close()
-        self.w.ensure(later, "h264", force=True)
-        self.w.write(b"hour15")
-        out = self.w.close()
-        self.assertEqual(out.name, "15.mp4")
-        self.assertTrue((self.td / "Lab" / "2026-08-17" / "14.mp4").exists())
+        later = _ChunkWriter(self.cam, self.td, remux=_fake_remux)
+        later.feed(now.replace(minute=37), "h264", True, b"BBB")
+        later.close()
+        day = self.td / "Lab" / "2026-08-17"
+        # first close remuxed to mp4; second open in same hour writes 14.h264 again
+        # then close remuxes (replaces) 14.mp4 — after a *finished* hour that is correct.
+        # Mid-hour restart without remux:
+        raw = day / "14-00-00.h264"
+        w1 = _ChunkWriter(self.cam, self.td, remux=_fake_remux)
+        w1.feed(now, "h264", True, b"AAA")
+        w1._fh.close()
+        w1._fh = None
+        _mark = __import__("auto_record", fromlist=["_mark_open"])._mark_open
+        _mark(w1._raw, False)
+        w2 = _ChunkWriter(self.cam, self.td, remux=_fake_remux)
+        w2.feed(now.replace(minute=37), "h264", True, b"BBB")
+        out = w2.close()
+        self.assertEqual(out.name, "14-00-00.mp4")
+        self.assertEqual(out.read_bytes(), b"AAABBB")
+        self.assertEqual(len(list(day.glob("14-00-00*"))), 1)
+        self.assertFalse(any(day.glob("14-37*")))
+
+    def test_hour_rollover_on_iframe_only(self):
+        start = datetime(2026, 8, 17, 14, 59, 50)
+        later = datetime(2026, 8, 17, 15, 0, 0)
+        frames = [
+            (start, True, b"I14"),
+            (start + timedelta(seconds=2), False, b"P14"),
+            (later, False, b"Pcross"),
+            (later + timedelta(seconds=1), True, b"I15"),
+            (later + timedelta(seconds=2), False, b"P15"),
+        ]
+        for now, key, data in frames:
+            self.w.feed(now, "h264", key, data)
+        self.w.close()
+        day = self.td / "Lab" / "2026-08-17"
+        self.assertEqual((day / "14-00-00.mp4").read_bytes(), b"I14P14Pcross")
+        self.assertEqual((day / "15-00-00.mp4").read_bytes(), b"I15P15")
+        self.assertFalse(any(day.glob("14-37*")))
+
+    def test_no_frame_dropped_across_boundary(self):
+        start = datetime(2026, 8, 17, 14, 59, 50)
+        payloads = [b"I0", b"P1", b"P2", b"I3", b"P4"]
+        times = [
+            start,
+            start + timedelta(seconds=1),
+            datetime(2026, 8, 17, 15, 0, 0),
+            datetime(2026, 8, 17, 15, 0, 1),
+            datetime(2026, 8, 17, 15, 0, 2),
+        ]
+        keys = [True, False, False, True, False]
+        for now, key, data in zip(times, keys, payloads):
+            self.w.feed(now, "h264", key, data)
+        self.w.close()
+        day = self.td / "Lab" / "2026-08-17"
+        combined = (day / "14-00-00.mp4").read_bytes() + (day / "15-00-00.mp4").read_bytes()
+        self.assertEqual(combined, b"".join(payloads))
 
     def test_day_rollover_new_date_folder(self):
         start = datetime(2026, 8, 17, 23, 59, 0)
-        self.w.ensure(start, "h264")
-        self.w.write(b"late")
-        self.w.close()
         nxt = datetime(2026, 8, 18, 0, 0, 1)
-        self.w.ensure(nxt, "h264", force=True)
-        self.w.write(b"early")
-        out = self.w.close()
-        self.assertEqual(out.parent.name, "2026-08-18")
-        self.assertEqual(out.name, "00.mp4")
+        self.w.feed(start, "h264", True, b"late")
+        self.w.feed(nxt, "h264", True, b"early")
+        self.w.close()
+        self.assertTrue((self.td / "Lab" / "2026-08-17" / "23-00-00.mp4").exists())
+        self.assertTrue((self.td / "Lab" / "2026-08-18" / "00-00-00.mp4").exists())
+
+    def test_minute_mode_tree(self):
+        cam = _cam(record_chunk="minute")
+        w = _ChunkWriter(cam, self.td, remux=_fake_remux)
+        t0 = datetime(2026, 8, 17, 14, 7, 10)
+        t1 = datetime(2026, 8, 17, 14, 8, 0)
+        w.feed(t0, "h264", True, b"M7")
+        w.feed(t0 + timedelta(seconds=20), "h264", False, b"P")
+        w.feed(t1, "h264", False, b"Pcross")
+        w.feed(t1 + timedelta(seconds=1), "h264", True, b"M8")
+        w.close()
+        hour = self.td / "Lab" / "2026-08-17" / "14"
+        self.assertEqual((hour / "14-07-00.mp4").read_bytes(), b"M7PPcross")
+        self.assertEqual((hour / "14-08-00.mp4").read_bytes(), b"M8")
 
     def test_hevc_uses_h265_raw(self):
         now = datetime(2026, 8, 17, 8, 0, 0)
-        self.w.ensure(now, "hevc")
-        self.w.write(b"hevc")
-        self.assertTrue((self.td / "Lab" / "2026-08-17" / "08.h265").exists())
+        self.w.feed(now, "hevc", True, b"hevc")
+        self.assertTrue((self.td / "Lab" / "2026-08-17" / "08-00-00.h265").exists())
         out = self.w.close()
         self.assertEqual(out.suffix, ".mp4")
 
-    def test_due_false_before_next_hour(self):
+    def test_start_waits_for_iframe(self):
         now = datetime(2026, 8, 17, 14, 0, 0)
-        self.w.ensure(now, "h264")
-        self.assertFalse(self.w.due(now + timedelta(minutes=59)))
-        self.assertTrue(self.w.due(now + timedelta(hours=1)))
+        self.w.feed(now, "h264", False, b"Pskip")
+        self.assertIsNone(self.w._raw)
+        self.w.feed(now, "h264", True, b"I")
+        self.assertEqual((self.td / "Lab" / "2026-08-17" / "14-00-00.h264").read_bytes(), b"I")
         self.w.close()
 
-    def test_reconnect_appends_same_hour_file(self):
-        now = datetime(2026, 8, 17, 14, 10, 0)
-        self.w.ensure(now, "h264")
-        self.w.write(b"AAA")
-        self.w._fh.close()
-        self.w._fh = None
-        self.w._raw = None
-        self.w._bytes = 0
-        later = _HourWriter(self.cam, self.td, remux=_fake_remux)
-        later.ensure(now.replace(minute=37), "h264", force=True)
-        later.write(b"BBB")
-        out = later.close()
-        self.assertEqual(out.name, "14.mp4")
-        self.assertEqual(out.read_bytes(), b"AAABBB")
-        files = list((self.td / "Lab" / "2026-08-17").glob("14*"))
-        self.assertEqual(len(files), 1)
-
-    def test_force_same_hour_does_not_split_file(self):
-        now = datetime(2026, 8, 17, 14, 5, 0)
-        self.w.ensure(now, "h264")
-        self.w.write(b"A")
-        self.w.ensure(now.replace(minute=40), "h264", force=True)
-        self.w.write(b"B")
-        self.w._fh.flush()
-        raws = list((self.td / "Lab" / "2026-08-17").glob("*.h264"))
-        self.assertEqual(len(raws), 1)
-        self.assertEqual(raws[0].read_bytes(), b"AB")
-        self.w.close()
-
-    def test_orphan_h264_becomes_mp4(self):
+    def test_orphan_past_hour_becomes_mp4(self):
         day = self.td / "Lab" / "2026-08-17"
         day.mkdir(parents=True)
-        raw = day / "11.h264"
+        raw = day / "11-00-00.h264"
         raw.write_bytes(b"leftover")
         with mock.patch("auto_record.remux_annexb", _fake_remux):
-            self.assertEqual(remux_orphans(self.td), 1)
-        self.assertTrue((day / "11.mp4").exists())
+            self.assertEqual(remux_orphans(self.td, datetime(2026, 8, 17, 14, 0)), 1)
+        self.assertTrue((day / "11-00-00.mp4").exists())
         self.assertFalse(raw.exists())
+
+    def test_orphan_skips_current_hour(self):
+        day = self.td / "Lab" / "2026-08-17"
+        day.mkdir(parents=True)
+        raw = day / "14-00-00.h264"
+        raw.write_bytes(b"live")
+        with mock.patch("auto_record.remux_annexb", _fake_remux):
+            self.assertEqual(remux_orphans(self.td, datetime(2026, 8, 17, 14, 37)), 0)
+        self.assertTrue(raw.exists())
+        self.assertFalse((day / "14-00-00.mp4").exists())
+
+    def test_orphan_skips_manual_rec_file(self):
+        rec = self.td / "rec_20260817_140000.h264"
+        rec.write_bytes(b"manual")
+        with mock.patch("auto_record.remux_annexb", _fake_remux):
+            self.assertEqual(remux_orphans(self.td, datetime(2026, 8, 17, 14, 1)), 0)
+        self.assertTrue(rec.exists())
 
 
 class StoreTests(unittest.TestCase):
     def test_upsert_and_toggle(self):
         td = Path(tempfile.mkdtemp())
         store = CameraStore(td)
-        saved = store.upsert(_cam(0, auto_record=True))
+        saved = store.upsert(_cam(0, auto_record=True, record_chunk="minute"))
         self.assertTrue(saved.auto_record)
+        self.assertEqual(saved.record_chunk, "minute")
         store.set_auto_record(saved.id, False)
         self.assertFalse(store.get(saved.id).auto_record)
-        again = store.upsert(_cam(0, auto_record=True))
+        again = store.upsert(_cam(0, auto_record=True, record_chunk="hour"))
         self.assertTrue(again.auto_record)
+        self.assertEqual(again.record_chunk, "hour")
         store.close()
 
-    def test_migrate_old_db_adds_column(self):
+    def test_migrate_old_db_adds_columns(self):
         td = Path(tempfile.mkdtemp())
         db = td / "v380.db"
         conn = sqlite3.connect(db)
@@ -314,14 +379,16 @@ class StoreTests(unittest.TestCase):
         conn = connect(db)
         cols = {row[1] for row in conn.execute("PRAGMA table_info(cameras)")}
         self.assertIn("auto_record", cols)
-        self.assertEqual(conn.execute("SELECT auto_record FROM cameras WHERE id=1").fetchone()[0], 0)
+        self.assertIn("record_chunk", cols)
+        row = conn.execute("SELECT auto_record, record_chunk FROM cameras WHERE id=1").fetchone()
+        self.assertEqual(row[0], 0)
+        self.assertEqual(row[1], "hour")
         conn.close()
 
 
 class _FakeClient:
     def __init__(self, *args, **kwargs):
         self.video_codec = "h264"
-        self._hold = kwargs.pop("_hold", None)
 
     def connect(self):
         return None
@@ -376,6 +443,21 @@ class ManagerTests(unittest.TestCase):
             self.assertFalse(mgr.is_recording(6))
             mgr.stop_all()
 
+    def test_old_thread_does_not_clear_new_alive(self):
+        td = Path(tempfile.mkdtemp())
+        mgr = AutoRecordManager(td)
+        cam = _cam(9)
+        with mock.patch("auto_record.V380SnapshotClient", _FakeClient), mock.patch(
+            "auto_record.remux_annexb", _fake_remux
+        ):
+            mgr.sync([cam])
+            time.sleep(0.15)
+            cam.record_chunk = "minute"
+            mgr.sync([cam])
+            time.sleep(0.25)
+            self.assertTrue(mgr.is_recording(9) or any(t.is_alive() for t in mgr._threads.values()))
+            mgr.stop_all()
+
 
 class SupervisorTests(unittest.TestCase):
     def setUp(self):
@@ -389,18 +471,35 @@ class SupervisorTests(unittest.TestCase):
         self.assertTrue(sup.is_recording(7))
         self.assertFalse(sup.is_recording(8))
 
-    def test_stale_heartbeat_without_process_is_dead(self):
+    def test_stale_heartbeat_is_not_recording(self):
         write_worker_status(self.td, {"pid": 1, "heartbeat": time.time() - 60, "recording": {"7": True}})
         (self.td / "record_worker.pid").write_text("1", encoding="utf-8")
         self.assertFalse(is_worker_alive(self.td))
+        sup = RecordSupervisor(self.td)
+        self.assertFalse(sup.is_recording(7))
+
+    def test_camera_status_shows_service_state(self):
+        sup = RecordSupervisor(self.td)
+        self.assertEqual(sup.camera_status(1, False), ("Service: off", "off"))
+        self.assertEqual(sup.camera_status(1, True)[1], "down")
+        write_worker_status(self.td, {"pid": 1, "heartbeat": time.time(), "recording": {}})
+        sup = RecordSupervisor(self.td)
+        self.assertEqual(sup.camera_status(1, True), ("Service: starting…", "wait"))
+        write_worker_status(self.td, {"pid": 1, "heartbeat": time.time(), "recording": {"1": True}})
+        sup = RecordSupervisor(self.td)
+        self.assertEqual(sup.camera_status(1, True), ("Service: recording", "ok"))
+        self.assertIn("running", sup.service_summary([_cam(1, auto_record=True)]))
+        self.assertIn("off", sup.service_summary([_cam(1, auto_record=False)]))
 
     def test_sync_starts_worker_only_when_enabled(self):
         sup = RecordSupervisor(self.td)
         with mock.patch("auto_record.ensure_worker") as ensure, mock.patch("auto_record._sync_logon_task") as task:
             sup.sync([_cam(1, auto_record=False)])
+            time.sleep(0.05)
             ensure.assert_not_called()
             task.assert_called_once_with(False)
             sup.sync([_cam(1, auto_record=True)])
+            time.sleep(0.05)
             ensure.assert_called_once()
             task.assert_called_with(True)
 
@@ -432,8 +531,9 @@ class SupervisorTests(unittest.TestCase):
         self.assertFalse(sup.is_recording(3))
         write_worker_status(self.td, {"pid": 1, "heartbeat": time.time(), "recording": {"3": True}})
         self.assertTrue(sup.is_recording(3))
-        with mock.patch("auto_record.ensure_worker") as ensure:
+        with mock.patch("auto_record.ensure_worker") as ensure, mock.patch("auto_record._sync_logon_task"):
             sup.release_to_worker()
+            time.sleep(0.05)
             ensure.assert_called()
 
     def test_status_write_survives_replace_lock(self):

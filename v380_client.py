@@ -5,10 +5,11 @@ from __future__ import annotations
 import queue
 import random
 import socket
+import subprocess
+import sys
 import threading
 import string
 import struct
-import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -25,6 +26,9 @@ COMMANDS = {
     "ptz_up": bytes([0xAA, 0x00, 0x00, 0x00, 0xE8, 0x03, 0xE8, 0x03, 0xE8, 0x03, 0xEB, 0x03, 0x00, 0x00, 0x01, 0x00]),
     "ptz_down": bytes([0xAA, 0x00, 0x00, 0x00, 0xE8, 0x03, 0xE8, 0x03, 0xE8, 0x03, 0xEC, 0x03, 0x00, 0x00, 0x01, 0x00]),
     "ptz_stop": bytes([0xAA, 0x00, 0x00, 0x00, 0xE8, 0x03, 0xE8, 0x03, 0xE8, 0x03, 0xE8, 0x03, 0x00, 0x00, 0x01, 0x00]),
+    # 1005 / 1006 on the unused PTZ channel (same 0xAA packet as pan/tilt)
+    "ptz_zoom_in": bytes([0xAA, 0x00, 0x00, 0x00, 0xED, 0x03, 0xE8, 0x03, 0xE8, 0x03, 0xE8, 0x03, 0x00, 0x00, 0x01, 0x00]),
+    "ptz_zoom_out": bytes([0xAA, 0x00, 0x00, 0x00, 0xEE, 0x03, 0xE8, 0x03, 0xE8, 0x03, 0xE8, 0x03, 0x00, 0x00, 0x01, 0x00]),
     "light_on": bytes([0xC4, 0x00, 0x00, 0x00, 0xE9, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
     "light_off": bytes([0xC4, 0x00, 0x00, 0x00, 0xEA, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
     "light_auto": bytes([0xC4, 0x00, 0x00, 0x00, 0xEB, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
@@ -32,6 +36,10 @@ COMMANDS = {
     "image_bw": bytes([0xC5, 0x00, 0x00, 0x00, 0xEA, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
     "image_auto": bytes([0xC5, 0x00, 0x00, 0x00, 0xEB, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
     "image_flip": bytes([0xBE, 0x00, 0x00, 0x00, 0xE8, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
+    "alert_on": bytes([0xC6, 0x00, 0x00, 0x00, 0xE9, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
+    "alert_off": bytes([0xC6, 0x00, 0x00, 0x00, 0xEA, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
+    "alert2_on": bytes([0xC7, 0x00, 0x00, 0x00, 0xE9, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
+    "alert2_off": bytes([0xC7, 0x00, 0x00, 0x00, 0xEA, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
 }
 
 
@@ -94,6 +102,15 @@ def decrypt_audio(data: bytearray, key: bytes) -> None:
     cipher = AES.new(key, AES.MODE_ECB)
     for i in range(0, aligned, 16):
         data[i : i + 16] = cipher.decrypt(bytes(data[i : i + 16]))
+
+
+def encrypt_audio(data: bytearray, key: bytes) -> None:
+    aligned = (len(data) // 16) * 16
+    if aligned == 0:
+        return
+    cipher = AES.new(key, AES.MODE_ECB)
+    for i in range(0, aligned, 16):
+        data[i : i + 16] = cipher.encrypt(bytes(data[i : i + 16]))
 
 
 def _prepare_ima_audio(
@@ -324,8 +341,12 @@ class V380SnapshotClient:
         self._stream_info = b""
         self.frame_stats: dict[int, int] = {}
         self._send_lock = threading.Lock()
+        self._talk_seq = 0
+        self._talk_on = False
+        self._talk_sock: socket.socket | None = None
 
     def close(self) -> None:
+        self.stop_talk()
         if self._sock is not None:
             try:
                 self._sock.close()
@@ -454,6 +475,69 @@ class V380SnapshotClient:
                 self._sock.sendall(pkt)
             return True
         except OSError:
+            return False
+
+    def start_talk(self) -> bool:
+        """Open a second TCP socket and send the V380 speak handshake (cmd 0x179)."""
+        self.stop_talk()
+        if not self.auth_ticket:
+            return False
+        try:
+            sock = socket.create_connection((self.ip, self.port), timeout=5)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            hs = bytearray(85)
+            hs[0:4] = _u32(0x179)
+            hs[4:8] = _u32(self.device_id)
+            hs[8:12] = _u32(self.auth_ticket)
+            sock.sendall(hs)
+        except OSError:
+            return False
+        self._talk_sock = sock
+        self._talk_on = True
+        self._talk_seq = 0
+        threading.Thread(target=self._talk_drain, daemon=True, name="v380-talk").start()
+        time.sleep(0.3)
+        return True
+
+    def _talk_drain(self) -> None:
+        sock = self._talk_sock
+        while self._talk_on and sock is not None:
+            try:
+                chunk = sock.recv(1024)
+            except OSError:
+                break
+            if not chunk:
+                break
+
+    def stop_talk(self) -> bool:
+        self._talk_on = False
+        sock = self._talk_sock
+        self._talk_sock = None
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        return True
+
+    def send_talk_audio(self, ima256: bytes) -> bool:
+        """Send one 256-byte IMA-ADPCM speak frame on the talk socket."""
+        sock = self._talk_sock
+        if not ima256 or sock is None or not self._talk_on:
+            return False
+        body = bytearray(ima256[:256])
+        if len(body) < 256:
+            body.extend(b"\x00" * (256 - len(body)))
+        if self.device_version > 30:
+            encrypt_audio(body, self.aes_key)
+        self._talk_seq += 1
+        header = bytearray.fromhex("b40000000100160000000000000001")
+        header.append(self._talk_seq & 0xFF)
+        try:
+            sock.sendall(bytes(header) + bytes(body))
+            return True
+        except OSError:
+            self._talk_on = False
             return False
 
     def read_iframe(self, timeout: float = 15.0) -> bytes:
@@ -636,6 +720,21 @@ class V380SnapshotClient:
         return iframe
 
 
+def _win_hide_kwargs() -> dict:
+    """Stop ffmpeg from flashing a console on Windows."""
+    if sys.platform != "win32":
+        return {}
+    kw: dict = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)}
+    try:
+        info = subprocess.STARTUPINFO()
+        info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        info.wShowWindow = 0
+        kw["startupinfo"] = info
+    except Exception:
+        pass
+    return kw
+
+
 def _ffmpeg_exe() -> str | None:
     from shutil import which
 
@@ -689,13 +788,14 @@ class LiveH264Decoder:
         if scale_width > 0:
             cmd.extend(["-vf", f"scale={scale_width}:-2"])
         cmd.extend(["-f", "image2pipe", "-vcodec", "mjpeg", "-q:v", str(jpeg_q), "pipe:1"])
-        self.proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            bufsize=0,
-        )
+        popen_kw: dict = {
+            "stdin": subprocess.PIPE,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.DEVNULL,
+            "bufsize": 0,
+        }
+        popen_kw.update(_win_hide_kwargs())
+        self.proc = subprocess.Popen(cmd, **popen_kw)
         self._queue = out_queue
         self._stop = threading.Event()
         self._in_q: queue.Queue = queue.Queue(maxsize=8)
@@ -826,6 +926,13 @@ def _decode_opencv(h264: bytes) -> bytes | None:
 
 def _decode_ffmpeg(h264: bytes, fmt: str = "h264") -> bytes | None:
     try:
+        run_kw: dict = {
+            "input": h264,
+            "capture_output": True,
+            "timeout": 8,
+            "check": False,
+        }
+        run_kw.update(_win_hide_kwargs())
         proc = subprocess.run(
             [
                 "ffmpeg",
@@ -844,10 +951,7 @@ def _decode_ffmpeg(h264: bytes, fmt: str = "h264") -> bytes | None:
                 "image2",
                 "pipe:1",
             ],
-            input=h264,
-            capture_output=True,
-            timeout=8,
-            check=False,
+            **run_kw,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return None

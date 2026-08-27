@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS cameras (
     source TEXT NOT NULL DEFAULT 'lan' CHECK (source IN ('lan', 'cloud')),
     quality INTEGER NOT NULL DEFAULT 1 CHECK (quality IN (0, 1)),
     auto_record INTEGER NOT NULL DEFAULT 0 CHECK (auto_record IN (0, 1)),
+    record_chunk TEXT NOT NULL DEFAULT 'hour' CHECK (record_chunk IN ('hour', 'minute')),
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -43,13 +44,16 @@ def _migrate(conn: sqlite3.Connection) -> None:
     cols = {row[1] for row in conn.execute("PRAGMA table_info(cameras)")}
     if "auto_record" not in cols:
         conn.execute("ALTER TABLE cameras ADD COLUMN auto_record INTEGER NOT NULL DEFAULT 0")
-        conn.commit()
+    if "record_chunk" not in cols:
+        conn.execute("ALTER TABLE cameras ADD COLUMN record_chunk TEXT NOT NULL DEFAULT 'hour'")
+    conn.commit()
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path), check_same_thread=False)
+    conn = sqlite3.connect(str(db_path), check_same_thread=False, timeout=10.0)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 10000")
     conn.executescript(SCHEMA)
     _migrate(conn)
     return conn

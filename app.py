@@ -6,6 +6,7 @@ import tkinter as tk
 
 from auto_record import RecordSupervisor
 from camera_store import Camera, CameraStore
+from clips import ClipsFrame
 from home import EditDialog, HomeFrame
 from live_view import LiveView
 from theme import BG
@@ -21,8 +22,9 @@ class StudioApp(tk.Tk):
 
         self.store = CameraStore()
         self.recorders = RecordSupervisor()
-        self._home = HomeFrame(self, self.store, self.recorders, self._add, self._view, self._edit)
+        self._home = HomeFrame(self, self.store, self.recorders, self._add, self._view, self._edit, self._show_clips)
         self._live: LiveView | None = None
+        self._clips_ui: ClipsFrame | None = None
         self._home.pack(fill="both", expand=True)
         self.recorders.sync(self.store.list())
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -32,8 +34,17 @@ class StudioApp(tk.Tk):
             self._live.shutdown()
             self._live.destroy()
             self._live = None
+        if self._clips_ui is not None:
+            self._clips_ui.destroy()
+            self._clips_ui = None
         self._home.pack(fill="both", expand=True)
         self._home.resume()
+
+    def _show_clips(self) -> None:
+        self._home.pause()
+        self._home.pack_forget()
+        self._clips_ui = ClipsFrame(self, on_back=self._show_home)
+        self._clips_ui.pack(fill="both", expand=True)
 
     def _show_live(self, camera: Camera | None, auto_connect: bool) -> None:
         self._home.pause()
@@ -76,15 +87,20 @@ class StudioApp(tk.Tk):
             source=fields["source"],
             quality=int(fields["quality"]),
             auto_record=existing.auto_record if existing else False,
+            record_chunk=existing.record_chunk if existing else "hour",
             created_at="",
             updated_at="",
         )
         self.store.upsert(cam)
         self.recorders.sync(self.store.list())
+        if self._live is None:
+            self._home.reload()
 
     def _on_close(self) -> None:
         if self._live is not None:
             self._live.shutdown()
+        if self._clips_ui is not None:
+            self._clips_ui.destroy()
         self._home.shutdown()
         self.recorders.release_to_worker()
         self.store.close()

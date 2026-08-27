@@ -20,6 +20,10 @@ def _now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
+def _chunk_mode(value: str | None) -> str:
+    return "minute" if value == "minute" else "hour"
+
+
 @dataclass
 class Camera:
     id: int
@@ -33,6 +37,7 @@ class Camera:
     source: str
     quality: int
     auto_record: bool
+    record_chunk: str
     created_at: str
     updated_at: str
 
@@ -43,6 +48,10 @@ class Camera:
     @property
     def source_name(self) -> str:
         return "Cloud" if self.source == "cloud" else "LAN"
+
+    @property
+    def chunk_label(self) -> str:
+        return "1 min" if self.record_chunk == "minute" else "hourly"
 
 
 class CameraStore:
@@ -82,12 +91,13 @@ class CameraStore:
                     """
                     UPDATE cameras SET
                         name=?, mac=?, ip=?, port=?, username=?, password_enc=?,
-                        source=?, quality=?, auto_record=?, updated_at=?
+                        source=?, quality=?, auto_record=?, record_chunk=?, updated_at=?
                     WHERE device_id=?
                     """,
                     (
                         cam.name, cam.mac, cam.ip, cam.port, cam.username, blob,
-                        cam.source, cam.quality, 1 if cam.auto_record else 0, now, cam.device_id,
+                        cam.source, cam.quality, 1 if cam.auto_record else 0,
+                        _chunk_mode(cam.record_chunk), now, cam.device_id,
                     ),
                 )
                 camera_id = int(existing["id"])
@@ -95,12 +105,13 @@ class CameraStore:
                 cur = self._conn.execute(
                     """
                     INSERT INTO cameras
-                        (name, device_id, mac, ip, port, username, password_enc, source, quality, auto_record, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        (name, device_id, mac, ip, port, username, password_enc, source, quality, auto_record, record_chunk, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         cam.name, cam.device_id, cam.mac, cam.ip, cam.port, cam.username, blob,
-                        cam.source, cam.quality, 1 if cam.auto_record else 0, now, now,
+                        cam.source, cam.quality, 1 if cam.auto_record else 0,
+                        _chunk_mode(cam.record_chunk), now, now,
                     ),
                 )
                 camera_id = int(cur.lastrowid)
@@ -116,15 +127,16 @@ class CameraStore:
         with self._lock:
             self._conn.execute(
                 """
-                UPDATE cameras SET
-                    name=?, device_id=?, mac=?, ip=?, port=?, username=?, password_enc=?,
-                    source=?, quality=?, auto_record=?, updated_at=?
-                WHERE id=?
-                """,
-                (
-                    cam.name, cam.device_id, cam.mac, cam.ip, cam.port, cam.username, blob,
-                    cam.source, cam.quality, 1 if cam.auto_record else 0, now, cam.id,
-                ),
+                    UPDATE cameras SET
+                        name=?, device_id=?, mac=?, ip=?, port=?, username=?, password_enc=?,
+                        source=?, quality=?, auto_record=?, record_chunk=?, updated_at=?
+                    WHERE id=?
+                    """,
+                    (
+                        cam.name, cam.device_id, cam.mac, cam.ip, cam.port, cam.username, blob,
+                        cam.source, cam.quality, 1 if cam.auto_record else 0,
+                        _chunk_mode(cam.record_chunk), now, cam.id,
+                    ),
             )
             self._conn.commit()
         saved = self.get(cam.id)
@@ -199,6 +211,7 @@ class CameraStore:
             source=row["source"],
             quality=int(row["quality"]),
             auto_record=bool(row["auto_record"]) if "auto_record" in row.keys() else False,
+            record_chunk=_chunk_mode(row["record_chunk"] if "record_chunk" in row.keys() else "hour"),
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )

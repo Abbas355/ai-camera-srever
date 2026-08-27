@@ -14,7 +14,7 @@ from tkinter import messagebox, ttk
 from PIL import Image, ImageTk
 
 from camera_store import Camera
-from extras import AlawPlayer, H264Recorder, discover_devices, get_relay_ip
+from extras import AlawPlayer, AlertSiren, H264Recorder, Talker, discover_devices, get_relay_ip
 from theme import ACCENT, BG, CARD, GREEN, MUTED, ORANGE, RED, TEXT
 from v380_client import LiveH264Decoder, V380SnapshotClient
 
@@ -44,6 +44,8 @@ class LiveView(tk.Frame):
         self._frames: queue.Queue[bytes] = queue.Queue(maxsize=3)
         self._decoder: LiveH264Decoder | None = None
         self._player = AlawPlayer()
+        self._talker = Talker()
+        self._alert = AlertSiren()
         self._recorder = H264Recorder(REC_DIR)
         self._last_jpeg: bytes | None = None
         self._fps_count = 0
@@ -55,6 +57,8 @@ class LiveView(tk.Frame):
         self._pending_mac = camera.mac if camera else ""
         self._saved_once = False
         self._alive = True
+        self._view_zoom = 1.0
+        self._alert_job = None
 
         self._build()
         if camera is not None:
@@ -133,6 +137,7 @@ class LiveView(tk.Frame):
         body.pack(fill="both", expand=True, padx=14, pady=(8, 14))
         self.canvas = tk.Label(body, bg="#020617", text="Live video", fg=MUTED)
         self.canvas.pack(side="left", fill="both", expand=True, padx=(0, 12))
+        self.canvas.bind("<MouseWheel>", self._on_wheel)
         self._build_controls(body)
 
     def _build_controls(self, parent: tk.Frame) -> None:
@@ -151,10 +156,12 @@ class LiveView(tk.Frame):
         media.pack(fill="x")
         self.listen_btn = btn(media, "Listen OFF", "#334155", self._toggle_listen, 11)
         self.listen_btn.grid(row=0, column=0, padx=3, pady=2)
-        btn(media, "Snapshot", ACCENT, self._snapshot, 11).grid(row=0, column=1, padx=3, pady=2)
+        self.talk_btn = btn(media, "Talk OFF", "#334155", self._toggle_talk, 11)
+        self.talk_btn.grid(row=0, column=1, padx=3, pady=2)
+        btn(media, "Snapshot", ACCENT, self._snapshot, 11).grid(row=1, column=0, padx=3, pady=2)
         self.rec_btn = btn(media, "Record", RED, self._toggle_record, 11)
-        self.rec_btn.grid(row=1, column=0, padx=3, pady=2)
-        btn(media, "Open folder", "#334155", self._open_folder, 11).grid(row=1, column=1, padx=3, pady=2)
+        self.rec_btn.grid(row=1, column=1, padx=3, pady=2)
+        btn(media, "Open folder", "#334155", self._open_folder, 11).grid(row=2, column=0, padx=3, pady=2)
 
         title("PTZ  (hold to move)")
         grid = tk.Frame(panel, bg=CARD)
@@ -171,6 +178,15 @@ class LiveView(tk.Frame):
         tk.Button(grid, text="STOP", width=7, bg="#334155", fg="white", relief="flat", command=lambda: self._cmd("ptz_stop")).grid(row=1, column=1, padx=3, pady=3)
         ptz(1, 2, "RIGHT", "ptz_right")
         ptz(2, 1, "DOWN", "ptz_down")
+        zoom_out = tk.Button(grid, text="ZOOM -", width=7, bg=ACCENT, fg="white", relief="flat")
+        zoom_out.grid(row=3, column=0, padx=3, pady=3)
+        zoom_out.bind("<ButtonPress-1>", lambda _e: self._zoom_hold("ptz_zoom_out", -0.25))
+        zoom_out.bind("<ButtonRelease-1>", lambda _e: self._cmd("ptz_stop"))
+        tk.Button(grid, text="1x", width=7, bg="#334155", fg="white", relief="flat", command=self._zoom_reset).grid(row=3, column=1, padx=3, pady=3)
+        zoom_in = tk.Button(grid, text="ZOOM +", width=7, bg=ACCENT, fg="white", relief="flat")
+        zoom_in.grid(row=3, column=2, padx=3, pady=3)
+        zoom_in.bind("<ButtonPress-1>", lambda _e: self._zoom_hold("ptz_zoom_in", 0.25))
+        zoom_in.bind("<ButtonRelease-1>", lambda _e: self._cmd("ptz_stop"))
 
         title("LIGHT")
         lights = tk.Frame(panel, bg=CARD)
@@ -186,8 +202,18 @@ class LiveView(tk.Frame):
         for i, (label, cmd) in enumerate((("AUTO", "image_auto"), ("FLIP", "image_flip"))):
             btn(imgs, label, ORANGE, lambda c=cmd: self._cmd(c), 11).grid(row=1, column=i, padx=3, pady=2)
 
+        title("ALERT")
+        alert = tk.Frame(panel, bg=CARD)
+        alert.pack(fill="x")
+        btn(alert, "ON", RED, self._alert_on, 11).grid(row=0, column=0, padx=3, pady=2)
+        btn(alert, "OFF", "#334155", self._alert_off, 11).grid(row=0, column=1, padx=3, pady=2)
+        hold = tk.Button(alert, text="HOLD", width=11, bg=RED, fg="white", relief="flat")
+        hold.grid(row=1, column=0, columnspan=2, padx=3, pady=2)
+        hold.bind("<ButtonPress-1>", lambda _e: self._alert_on())
+        hold.bind("<ButtonRelease-1>", lambda _e: self._alert_off())
+
         title("NOT IN PROTOCOL YET")
-        tk.Label(panel, text="Talk / Siren / SD playback\nneed extra APK packets.", fg="#64748b", bg=CARD, justify="left").pack(anchor="w")
+        tk.Label(panel, text="SD playback needs extra APK packets.", fg="#64748b", bg=CARD, justify="left").pack(anchor="w")
 
     def _apply_camera(self, cam: Camera) -> None:
         self.name_e.delete(0, "end")
@@ -240,8 +266,13 @@ class LiveView(tk.Frame):
         }
 
     def _set_status(self, text: str) -> None:
-        if self._alive:
-            self.status.configure(text=text)
+        if not self._alive:
+            return
+        try:
+            if self.winfo_exists():
+                self.status.configure(text=text)
+        except Exception:
+            return
 
     def _set_codec(self, label: str) -> None:
         self._codec_label = label
@@ -294,6 +325,56 @@ class LiveView(tk.Frame):
         ok = client.send_control(name)
         self._set_status(f"Sent {name.replace('_', ' ')}" if ok else f"Control failed: {name}")
 
+    def _alert_on(self) -> None:
+        if self._client is None:
+            self._set_status("Connect first, then Alert")
+            return
+        if self._alert.start(self._client):
+            if self._alert.using_file:
+                self._set_status("Alert ON — playing audio/alert.wav")
+            else:
+                self._set_status("Alert ON — beep (put a WAV in audio/alert.wav for a voice)")
+        else:
+            self._set_status("Alert failed — connect first")
+            return
+        if self._alert_job is not None:
+            try:
+                self.after_cancel(self._alert_job)
+            except Exception:
+                pass
+        self._alert_job = self.after(20000, self._alert_auto_off)
+
+    def _alert_off(self) -> None:
+        if self._alert_job is not None:
+            try:
+                self.after_cancel(self._alert_job)
+            except Exception:
+                pass
+            self._alert_job = None
+        self._alert.stop()
+        self._set_status("Alert off")
+
+    def _alert_auto_off(self) -> None:
+        self._alert_job = None
+        if self._alive:
+            self._alert.stop()
+            self._set_status("Alert off")
+
+    def _set_zoom(self, value: float) -> None:
+        self._view_zoom = min(4.0, max(1.0, round(value, 2)))
+        self._set_status(f"Zoom {self._view_zoom:.0%}")
+
+    def _zoom_hold(self, cmd: str, step: float) -> None:
+        self._set_zoom(self._view_zoom + step)
+        self._cmd(cmd)
+
+    def _zoom_reset(self) -> None:
+        self._set_zoom(1.0)
+
+    def _on_wheel(self, evt) -> None:
+        step = 0.25 if getattr(evt, "delta", 0) > 0 else -0.25
+        self._set_zoom(self._view_zoom + step)
+
     def _toggle_listen(self) -> None:
         self._player.enabled = not self._player.enabled
         self.listen_btn.configure(text="Listen ON" if self._player.enabled else "Listen OFF", bg=GREEN if self._player.enabled else "#334155")
@@ -302,6 +383,37 @@ class LiveView(tk.Frame):
             self._set_status(f"Listen ON ({ac}, 8 kHz) — use PC speakers")
         else:
             self._set_status("Listen off")
+
+    def _toggle_talk(self) -> None:
+        if self._talker.enabled:
+            self._talker.stop()
+            self.talk_btn.configure(text="Talk OFF", bg="#334155")
+            self._set_status("Talk off")
+            return
+        if self._client is None:
+            self._set_status("Connect first, then Talk")
+            return
+        self._talker.attach(self._client)
+        if self._talker.start():
+            self.talk_btn.configure(text="Talk ON", bg=GREEN)
+            self._set_status("Talk ON — speak into the PC microphone")
+        else:
+            self.talk_btn.configure(text="Talk OFF", bg="#334155")
+            err = self._talker.error or "unknown error"
+            self._set_status(f"Talk failed — {err}")
+            if "microphone" in err.lower() or "invalid" in err.lower() or "device" in err.lower():
+                open_settings = messagebox.askyesno(
+                    "Microphone blocked",
+                    "Windows is blocking the microphone, so there is no Allow button in this app.\n\n"
+                    "Turn ON both of these:\n"
+                    "• Microphone access\n"
+                    "• Let desktop apps access your microphone\n\n"
+                    "Open Windows microphone settings now?",
+                )
+                if open_settings:
+                    Talker.open_mic_settings()
+            else:
+                messagebox.showerror("Talk failed", err)
 
     def _snapshot(self) -> None:
         if not self._last_jpeg:
@@ -369,6 +481,7 @@ class LiveView(tk.Frame):
                     client = V380SnapshotClient(host, device_id, user, password, port, quality=quality, source=source)
                     client.connect()
                     self._client = client
+                    self._talker.attach(client)
                     if not self._saved_once and self._on_connected is not None:
                         self._saved_once = True
                         self._ui( lambda f=fields: self._on_connected(f))
@@ -413,6 +526,8 @@ class LiveView(tk.Frame):
                         decoder.close()
                     if self._decoder is decoder:
                         self._decoder = None
+                    self._talker.stop()
+                    self._ui(lambda: self.talk_btn.configure(text="Talk OFF", bg="#334155"))
                     if client is not None:
                         client.close()
                     if self._client is client:
@@ -433,6 +548,13 @@ class LiveView(tk.Frame):
         self._stop.set()
         if self._recorder.active:
             self._toggle_record()
+        if self._client is not None:
+            try:
+                self._alert.stop()
+            except Exception:
+                pass
+        self._talker.stop()
+        self.talk_btn.configure(text="Talk OFF", bg="#334155")
         if self._decoder is not None:
             self._decoder.close()
         if self._client is not None:
@@ -443,35 +565,47 @@ class LiveView(tk.Frame):
     def _drain_frames(self) -> None:
         if not self._alive:
             return
-        latest = None
-        while True:
-            try:
-                latest = self._frames.get_nowait()
-            except queue.Empty:
-                break
-        if latest:
-            self._last_jpeg = latest
-            img = Image.open(io.BytesIO(latest))
-            w = max(self.canvas.winfo_width(), 320)
-            h = max(self.canvas.winfo_height(), 240)
-            img.thumbnail((w, h), Image.Resampling.BILINEAR)
-            self._photo = ImageTk.PhotoImage(img)
-            self.canvas.configure(image=self._photo, text="")
-            self._fps_count += 1
-            now = time.time()
-            if self._fps_t == 0:
-                self._fps_t = now
-            elif now - self._fps_t >= 1.0:
-                fps = self._fps_count / (now - self._fps_t)
-                self._fps_count = 0
-                self._fps_t = now
-                rec = "  REC" if self._recorder.active else ""
-                mic = ""
-                if self._player.enabled:
-                    ac = "IMA" if self._client and self._client.audio_codec == "ima" else "G.711"
-                    mic = f"  MIC {ac}"
-                self._set_status(f"Live  {self._codec_label}  {self._quality_name}  {fps:.0f} fps{mic}{rec}")
-        self.after(16, self._drain_frames)
+        try:
+            latest = None
+            while True:
+                try:
+                    latest = self._frames.get_nowait()
+                except queue.Empty:
+                    break
+            if latest:
+                self._last_jpeg = latest
+                img = Image.open(io.BytesIO(latest))
+                if self._view_zoom > 1.01:
+                    zw, zh = img.size
+                    cw = max(8, int(zw / self._view_zoom))
+                    ch = max(8, int(zh / self._view_zoom))
+                    x = (zw - cw) // 2
+                    y = (zh - ch) // 2
+                    img = img.crop((x, y, x + cw, y + ch))
+                w = max(self.canvas.winfo_width(), 320)
+                h = max(self.canvas.winfo_height(), 240)
+                img.thumbnail((w, h), Image.Resampling.BILINEAR)
+                self._photo = ImageTk.PhotoImage(img)
+                self.canvas.configure(image=self._photo, text="")
+                self._fps_count += 1
+                now = time.time()
+                if self._fps_t == 0:
+                    self._fps_t = now
+                elif now - self._fps_t >= 1.0:
+                    fps = self._fps_count / (now - self._fps_t)
+                    self._fps_count = 0
+                    self._fps_t = now
+                    rec = "  REC" if self._recorder.active else ""
+                    mic = ""
+                    if self._player.enabled:
+                        ac = "IMA" if self._client and self._client.audio_codec == "ima" else "G.711"
+                        mic = f"  MIC {ac}"
+                    zoom = f"  {self._view_zoom:.0%}" if self._view_zoom > 1.01 else ""
+                    self._set_status(f"Live  {self._codec_label}  {self._quality_name}  {fps:.0f} fps{mic}{rec}{zoom}")
+        except Exception:
+            pass
+        if self._alive:
+            self.after(50, self._drain_frames)
 
     def go_back(self) -> None:
         self.shutdown()
@@ -482,6 +616,12 @@ class LiveView(tk.Frame):
         self._stop.set()
         if self._recorder.active:
             self._recorder.stop()
+        if self._client is not None:
+            try:
+                self._alert.stop()
+            except Exception:
+                pass
+        self._talker.close()
         self._player.close()
         if self._decoder is not None:
             self._decoder.close()

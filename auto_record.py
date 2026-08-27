@@ -1,4 +1,10 @@
-"""Per-camera background recording: recordings/<name>/<YYYY-MM-DD>/<HH>.mp4."""
+"""Per-camera background recording.
+
+Hourly:  recordings/<name>/<YYYY-MM-DD>/<HH>.h264 → .mp4
+1-min:   recordings/<name>/<YYYY-MM-DD>/<HH>/<MM>.h264 → .mp4
+
+The open chunk stays raw. Only a finished slot is remuxed.
+"""
 
 from __future__ import annotations
 
@@ -94,91 +100,145 @@ def camera_folder(cam: Camera, rec_dir: Path | None = None) -> Path:
         return path
 
 
-def _hour_stamp(now: datetime) -> tuple[str, str, datetime]:
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_HH_RE = re.compile(r"^\d{2}$")
+
+
+def chunk_mode(value: str | None) -> str:
+    return "minute" if value == "minute" else "hour"
+
+
+def _chunk_stamp(now: datetime, mode: str) -> tuple[str, str, str | None, datetime]:
     day = now.strftime("%Y-%m-%d")
     hour = now.strftime("%H")
-    next_hour = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-    return day, hour, next_hour
+    if mode == "minute":
+        minute = now.strftime("%M")
+        until = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
+        return day, hour, minute, until
+    until = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    return day, hour, None, until
 
 
-def _stem_taken(day_dir: Path, stem: str) -> bool:
-    if not day_dir.exists():
+def _raw_ext(fmt: str) -> str:
+    return "h265" if fmt == "hevc" else "h264"
+
+
+def _slot_stem(hour: str, minute: str | None) -> str:
+    if minute is None:
+        return f"{hour}-00-00"
+    return f"{hour}-{minute}-00"
+
+
+def _chunk_raw_path(folder: Path, day: str, hour: str, minute: str | None, fmt: str) -> Path:
+    """Hourly: date/HH-00-00.h264. Minute: date/HH/HH-MM-00.h264."""
+    folder.mkdir(parents=True, exist_ok=True)
+    day_dir = folder / day
+    day_dir.mkdir(parents=True, exist_ok=True)
+    ext = _raw_ext(fmt)
+    if minute is None:
+        return day_dir / f"{_slot_stem(hour, None)}.{ext}"
+    hour_dir = day_dir / hour
+    hour_dir.mkdir(parents=True, exist_ok=True)
+    return hour_dir / f"{_slot_stem(hour, minute)}.{ext}"
+
+
+def is_current_slot(path: Path, now: datetime | None = None) -> bool:
+    """True if this raw file is the still-open clock slot (must stay .h264)."""
+    now = now or datetime.now()
+    day = now.strftime("%Y-%m-%d")
+    hour = now.strftime("%H")
+    minute = now.strftime("%M")
+    if path.suffix not in (".h264", ".h265"):
         return False
-    try:
-        for item in day_dir.iterdir():
-            if item.is_file() and (item.name == stem or item.stem == stem):
-                return True
-    except OSError:
-        return False
+    stem = path.stem
+    parent = path.parent.name
+    grand = path.parent.parent.name if path.parent.parent else ""
+    if parent == day and stem == _slot_stem(hour, None):
+        return True
+    if parent == hour and grand == day and stem == _slot_stem(hour, minute):
+        return True
+    if _DATE_RE.match(parent) and _HH_RE.match(stem):
+        return parent == day and stem == hour
+    if _HH_RE.match(parent) and _DATE_RE.match(grand) and _HH_RE.match(stem):
+        return grand == day and parent == hour and stem == minute
     return False
 
 
-def _segment_path(folder: Path, day: str, hour: str, now: datetime) -> Path:
-    """Return a unique stem (no suffix): HH, or HH-MM, or HH-MM-SS[-n] if those exist."""
-    folder.mkdir(parents=True, exist_ok=True)
-    day_dir = folder / day
-    day_dir.mkdir(parents=True, exist_ok=True)
-    if not _stem_taken(day_dir, hour):
-        return day_dir / hour
-    minute = f"{hour}-{now.strftime('%M')}"
-    if not _stem_taken(day_dir, minute):
-        return day_dir / minute
-    second = f"{minute}-{now.strftime('%S')}"
-    if not _stem_taken(day_dir, second):
-        return day_dir / second
-    n = 2
-    while _stem_taken(day_dir, f"{second}-{n}"):
-        n += 1
-        if n > 999:
-            return day_dir / f"{second}-{int(now.timestamp())}"
-    return day_dir / f"{second}-{n}"
+def should_leave_raw(path: Path, now: datetime | None = None) -> bool:
+    if path.name.startswith("rec_"):
+        return True
+    return is_current_slot(path, now)
 
 
-def _hour_raw_path(folder: Path, day: str, hour: str, fmt: str, now: datetime) -> Path:
-    """Keep one in-progress HH.h264; split only if that hour was already remuxed to mp4."""
-    folder.mkdir(parents=True, exist_ok=True)
-    day_dir = folder / day
-    day_dir.mkdir(parents=True, exist_ok=True)
-    ext = "h265" if fmt == "hevc" else "h264"
-    primary = day_dir / f"{hour}.{ext}"
-    mp4 = day_dir / f"{hour}.mp4"
-    if mp4.exists() and primary.exists():
-        return _segment_path(folder, day, hour, now).with_suffix(f".{ext}")
-    if mp4.exists():
-        return _segment_path(folder, day, hour, now).with_suffix(f".{ext}")
-    return primary
+def rename_legacy_names(root: Path | None = None) -> int:
+    """Turn old 27.mp4 / 14.mp4 names into 14-27-00.mp4 / 14-00-00.mp4."""
+    root = root or REC_DIR
+    if not root.exists():
+        return 0
+    clock = datetime.now()
+    done = 0
+    for path in list(root.rglob("*")):
+        if not path.is_file() or path.suffix.lower() not in (".mp4", ".h264", ".h265"):
+            continue
+        stem = path.stem
+        if not _HH_RE.match(stem):
+            continue
+        if path.suffix.lower() != ".mp4" and should_leave_raw(path, clock):
+            continue
+        parent = path.parent.name
+        if _HH_RE.match(parent):
+            new_name = f"{parent}-{stem}-00{path.suffix.lower()}"
+        elif _DATE_RE.match(parent):
+            new_name = f"{stem}-00-00{path.suffix.lower()}"
+        else:
+            continue
+        dest = path.with_name(new_name)
+        if dest.exists():
+            continue
+        try:
+            path.rename(dest)
+            done += 1
+        except OSError:
+            pass
+    return done
 
 
 _OPEN_RAW: set[str] = set()
 _OPEN_LOCK = threading.Lock()
 
 
+def _path_key(path: Path) -> str:
+    try:
+        return str(path.resolve())
+    except OSError:
+        return str(path)
+
+
 def _mark_open(path: Path | None, open_: bool) -> None:
     if path is None:
         return
-    key = str(path.resolve()) if path.exists() or open_ else str(path)
+    keys = {_path_key(path), str(path)}
     with _OPEN_LOCK:
         if open_:
-            _OPEN_RAW.add(str(path))
+            _OPEN_RAW.update(keys)
         else:
-            _OPEN_RAW.discard(str(path))
-            try:
-                _OPEN_RAW.discard(str(path.resolve()))
-            except OSError:
-                pass
+            _OPEN_RAW.difference_update(keys)
 
 
-def remux_orphans(rec_dir: Path | None) -> int:
-    """Turn leftover .h264/.h265 into .mp4 after a crash or GUI close."""
+def remux_orphans(rec_dir: Path | None, now: datetime | None = None) -> int:
+    """Remux finished leftover raw files. Never touch the current slot or rec_*."""
     root = rec_dir or REC_DIR
     if not root.exists():
         return 0
+    rename_legacy_names(root)
+    clock = now or datetime.now()
     done = 0
     for ext, fmt in ((".h264", "h264"), (".h265", "hevc")):
         for path in root.rglob(f"*{ext}"):
-            key = str(path)
+            if should_leave_raw(path, clock):
+                continue
             with _OPEN_LOCK:
-                busy = key in _OPEN_RAW or str(path.resolve()) in _OPEN_RAW
+                busy = str(path) in _OPEN_RAW or _path_key(path) in _OPEN_RAW
             if busy:
                 continue
             try:
@@ -240,54 +300,61 @@ def wait_remux(timeout: float = 180.0) -> None:
     done.wait(timeout)
 
 
-class _HourWriter:
+class _ChunkWriter:
+    """Writes one stable slot file. Splits on the first I-frame after the clock."""
+
     def __init__(self, cam: Camera, rec_dir: Path | None = None, remux=None):
         self._cam = cam
         self._rec_dir = rec_dir
         self._remux = remux or _schedule_remux
+        self._mode = chunk_mode(getattr(cam, "record_chunk", "hour"))
         self._fh = None
         self._raw: Path | None = None
         self._fmt = "h264"
-        self._day = ""
-        self._hour = ""
         self._until = datetime.now()
         self._bytes = 0
-        self._flush_at = 0.0
 
-    def ensure(self, now: datetime, fmt: str, force: bool = False) -> None:
-        day, hour, until = _hour_stamp(now)
-        want = "hevc" if fmt == "hevc" else "h264"
-        if self._fh is not None and day == self._day and hour == self._hour and want == self._fmt:
+    def feed(self, now: datetime, fmt: str, is_iframe: bool, annexb: bytes) -> None:
+        if not annexb:
             return
-        if self._fh is not None:
+        want = "hevc" if fmt == "hevc" else "h264"
+        if self._fh is None:
+            if not is_iframe:
+                return
+            self._open(now, want)
+            self._write(annexb)
+            return
+        rotate = is_iframe and (now >= self._until or want != self._fmt)
+        if rotate:
             self.close()
-        self._fmt = want
-        raw = _hour_raw_path(camera_folder(self._cam, self._rec_dir), day, hour, want, now)
+            self._open(now, want)
+        self._write(annexb)
+
+    def _open(self, now: datetime, fmt: str) -> None:
+        day, hour, minute, until = _chunk_stamp(now, self._mode)
+        raw = _chunk_raw_path(camera_folder(self._cam, self._rec_dir), day, hour, minute, fmt)
         mode = "ab" if raw.exists() else "wb"
         self._raw = raw
         self._fh = raw.open(mode)
         self._bytes = raw.stat().st_size
-        self._day = day
-        self._hour = hour
+        self._fmt = fmt
         self._until = until
-        self._flush_at = time.monotonic()
         _mark_open(raw, True)
 
-    def due(self, now: datetime) -> bool:
-        return self._fh is not None and now >= self._until
-
-    def write(self, annexb: bytes) -> None:
-        if self._fh is None or not annexb:
+    def _write(self, annexb: bytes) -> None:
+        if self._fh is None:
             return
-        self._fh.write(annexb)
-        self._bytes += len(annexb)
-        now = time.monotonic()
-        if now - self._flush_at >= 1.0:
+        try:
+            self._fh.write(annexb)
+            self._bytes += len(annexb)
+            self._fh.flush()
+        except OSError:
             try:
-                self._fh.flush()
+                self._fh.close()
             except OSError:
                 pass
-            self._flush_at = now
+            self._fh = None
+            _mark_open(self._raw, False)
 
     def close(self) -> Path | None:
         if self._fh is not None:
@@ -295,7 +362,10 @@ class _HourWriter:
                 self._fh.flush()
             except OSError:
                 pass
-            self._fh.close()
+            try:
+                self._fh.close()
+            except OSError:
+                pass
             self._fh = None
         path = self._raw
         self._raw = None
@@ -308,6 +378,10 @@ class _HourWriter:
             path.unlink(missing_ok=True)
             return None
         return self._remux(path, self._fmt)
+
+
+# Older tests / imports
+_HourWriter = _ChunkWriter
 
 
 class AutoRecordManager:
@@ -328,7 +402,16 @@ class AutoRecordManager:
                     flag.set()
                     self._spec.pop(cam_id, None)
             for cam in wanted.values():
-                spec = (cam.ip, cam.port, cam.username, cam.password, cam.quality, cam.source)
+                spec = (
+                    cam.ip,
+                    cam.port,
+                    cam.username,
+                    cam.password,
+                    cam.quality,
+                    cam.source,
+                    chunk_mode(getattr(cam, "record_chunk", "hour")),
+                    cam.name,
+                )
                 alive = cam.id in self._threads and self._threads[cam.id].is_alive()
                 if alive and self._spec.get(cam.id) == spec:
                     continue
@@ -364,7 +447,7 @@ class AutoRecordManager:
             self._alive.clear()
 
     def _run(self, cam: Camera, flag: threading.Event) -> None:
-        writer = _HourWriter(cam, self._rec_dir)
+        writer = _ChunkWriter(cam, self._rec_dir)
         self._alive[cam.id] = False
         try:
             while not self._stop.is_set() and not flag.is_set():
@@ -391,17 +474,11 @@ class AutoRecordManager:
                             break
                         if kind != "video":
                             continue
-                        now = datetime.now()
-                        fmt = client.video_codec
-                        if writer.due(now):
-                            writer.close()
-                            need_key = True
                         if need_key and not is_iframe:
                             continue
-                        writer.ensure(now, fmt)
                         need_key = False
                         rec = client.h264_for_decode(payload) if is_iframe else payload
-                        writer.write(rec)
+                        writer.feed(datetime.now(), client.video_codec, bool(is_iframe), rec)
                         self._alive[cam.id] = True
                 except Exception as exc:
                     self._alive[cam.id] = False
@@ -417,17 +494,18 @@ class AutoRecordManager:
                             pass
         finally:
             writer.close()
-            self._alive[cam.id] = False
             with self._lock:
+                if self._flags.get(cam.id) is flag:
+                    self._alive[cam.id] = False
+                    self._flags.pop(cam.id, None)
                 if self._threads.get(cam.id) is threading.current_thread():
                     self._threads.pop(cam.id, None)
-                if self._flags.get(cam.id) is flag:
-                    self._flags.pop(cam.id, None)
 
 
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 TASK_NAME = "V380StudioAutoRecord"
+WATCH_TASK_NAME = "V380StudioAutoRecordWatch"
 _MUTEX_HANDLE = None
 _CREATE_NO_WINDOW = 0x08000000
 _CREATE_NEW_PROCESS_GROUP = 0x00000200
@@ -646,32 +724,38 @@ def logon_task_command() -> str:
     return f'"{_python_exe()}" "{_worker_script()}"'
 
 
+def _run_schtasks(args: list[str]) -> None:
+    subprocess.run(args, capture_output=True, text=True, timeout=15, check=False)
+
+
 def _sync_logon_task(enabled: bool) -> None:
     if sys.platform != "win32":
         return
     try:
         if enabled:
-            subprocess.run(
+            cmd = logon_task_command()
+            _run_schtasks(
                 [
                     "schtasks", "/Create", "/F",
                     "/TN", TASK_NAME,
                     "/SC", "ONLOGON",
                     "/RL", "LIMITED",
-                    "/TR", logon_task_command(),
-                ],
-                capture_output=True,
-                text=True,
-                timeout=15,
-                check=False,
+                    "/TR", cmd,
+                ]
+            )
+            _run_schtasks(
+                [
+                    "schtasks", "/Create", "/F",
+                    "/TN", WATCH_TASK_NAME,
+                    "/SC", "MINUTE",
+                    "/MO", "5",
+                    "/RL", "LIMITED",
+                    "/TR", cmd,
+                ]
             )
         else:
-            subprocess.run(
-                ["schtasks", "/Delete", "/F", "/TN", TASK_NAME],
-                capture_output=True,
-                text=True,
-                timeout=15,
-                check=False,
-            )
+            _run_schtasks(["schtasks", "/Delete", "/F", "/TN", TASK_NAME])
+            _run_schtasks(["schtasks", "/Delete", "/F", "/TN", WATCH_TASK_NAME])
     except Exception:
         pass
 
@@ -733,11 +817,6 @@ def run_worker_forever(data_dir: Path | None = None, rec_dir: Path | None = None
                 )
             except Exception as exc:
                 _log(root, f"status write failed: {exc}")
-            if int(time.time()) % 60 < 2:
-                try:
-                    remux_orphans(rec)
-                except Exception as exc:
-                    _log(root, f"orphan remux failed: {exc}")
             if enabled:
                 idle_since = None
             else:
@@ -770,12 +849,26 @@ class RecordSupervisor:
         self._rec_dir = rec_dir
         self._enabled: set[int] = set()
         self._watch_at = 0.0
+        self._status: dict = {}
+        self._status_at = 0.0
+        self._status_mtime = -1.0
+
+    def _kick_worker(self) -> None:
+        data_dir = self._data_dir
+        rec_dir = self._rec_dir
+        enabled = bool(self._enabled)
+
+        def work() -> None:
+            _sync_logon_task(enabled)
+            if enabled:
+                ensure_worker(data_dir, rec_dir)
+
+        threading.Thread(target=work, daemon=True, name="rec-supervisor").start()
 
     def sync(self, cameras: list[Camera]) -> None:
         self._enabled = {c.id for c in cameras if c.auto_record}
-        _sync_logon_task(bool(self._enabled))
-        if self._enabled:
-            ensure_worker(self._data_dir, self._rec_dir)
+        self._status_at = 0.0
+        self._kick_worker()
 
     def watch(self) -> None:
         if not self._enabled:
@@ -785,21 +878,62 @@ class RecordSupervisor:
             return
         self._watch_at = now
         if not is_worker_alive(self._data_dir):
-            ensure_worker(self._data_dir, self._rec_dir)
+            self._kick_worker()
 
     def on_video(self, cam: Camera, is_iframe: bool, payload: bytes, client) -> None:
         return None
 
+    def _status_fresh(self) -> dict:
+        now = time.time()
+        path = _status_path(self._data_dir)
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        if now - self._status_at >= 0.25 or mtime != self._status_mtime:
+            self._status = read_worker_status(self._data_dir)
+            self._status_at = now
+            self._status_mtime = mtime
+        return self._status
+
+    def service_running(self) -> bool:
+        status = self._status_fresh()
+        try:
+            beat = float(status.get("heartbeat") or 0)
+        except (TypeError, ValueError):
+            return False
+        return bool(beat) and (time.time() - beat) <= _HEARTBEAT_MAX_AGE
+
     def is_recording(self, camera_id: int) -> bool:
-        status = read_worker_status(self._data_dir)
-        rec = status.get("recording") or {}
+        if not self.service_running():
+            return False
+        rec = self._status_fresh().get("recording") or {}
         if isinstance(rec, dict):
             return bool(rec.get(str(camera_id)) or rec.get(camera_id))
         return False
 
+    def camera_status(self, camera_id: int, enabled: bool) -> tuple[str, str]:
+        """Human status for one camera: (text, level off|ok|wait|down)."""
+        if not enabled:
+            return "Service: off", "off"
+        if self.is_recording(camera_id):
+            return "Service: recording", "ok"
+        if self.service_running():
+            return "Service: starting…", "wait"
+        return "Service: not running", "down"
+
+    def service_summary(self, cameras: list[Camera]) -> str:
+        wanted = [c for c in cameras if c.auto_record]
+        if not wanted:
+            return "Record service: off"
+        writing = sum(1 for c in wanted if self.is_recording(c.id))
+        if self.service_running():
+            return f"Record service: running  ·  {writing}/{len(wanted)} camera(s) saving"
+        return "Record service: not running  ·  waiting to start"
+
     def release_to_worker(self) -> None:
         if self._enabled:
-            ensure_worker(self._data_dir, self._rec_dir)
+            self._kick_worker()
 
     def stop_all(self) -> None:
         return None
