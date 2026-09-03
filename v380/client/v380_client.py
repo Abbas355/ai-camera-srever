@@ -29,6 +29,11 @@ COMMANDS = {
     # 1005 / 1006 on the unused PTZ channel (same 0xAA packet as pan/tilt)
     "ptz_zoom_in": bytes([0xAA, 0x00, 0x00, 0x00, 0xED, 0x03, 0xE8, 0x03, 0xE8, 0x03, 0xE8, 0x03, 0x00, 0x00, 0x01, 0x00]),
     "ptz_zoom_out": bytes([0xAA, 0x00, 0x00, 0x00, 0xEE, 0x03, 0xE8, 0x03, 0xE8, 0x03, 0xE8, 0x03, 0x00, 0x00, 0x01, 0x00]),
+    # PTZ self-check / coordinate calibration (V380 app: More → PTZ calibration).
+    # 0xEF (1007) follows the same channel layout as zoom 1005/1006.
+    "ptz_calibrate": bytes([0xAA, 0x00, 0x00, 0x00, 0xEF, 0x03, 0xE8, 0x03, 0xE8, 0x03, 0xE8, 0x03, 0x00, 0x00, 0x01, 0x00]),
+    # Alternate opcode family next to image_flip (0xBE).
+    "ptz_calibrate_alt": bytes([0xBD, 0x00, 0x00, 0x00, 0xE9, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
     "light_on": bytes([0xC4, 0x00, 0x00, 0x00, 0xE9, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
     "light_off": bytes([0xC4, 0x00, 0x00, 0x00, 0xEA, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
     "light_auto": bytes([0xC4, 0x00, 0x00, 0x00, 0xEB, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
@@ -45,6 +50,18 @@ COMMANDS = {
 
 def _u32(v: int) -> bytes:
     return struct.pack("<I", v & 0xFFFFFFFF)
+
+
+def ptz_preset_set_packet(slot: int) -> bytes:
+    """Best-effort Macrovideo-style preset SET (slot 1–6)."""
+    n = max(1, min(6, int(slot)))
+    return bytes([0xAA, 0x00, 0x00, 0x00, 0xE8, 0x03, 0xE8, 0x03, 0xE8, 0x03, 0xE8, 0x03, n & 0xFF, 0x00, 0x02, 0x00])
+
+
+def ptz_preset_call_packet(slot: int) -> bytes:
+    """Best-effort Macrovideo-style preset CALL (slot 1–6)."""
+    n = max(1, min(6, int(slot)))
+    return bytes([0xAA, 0x00, 0x00, 0x00, 0xE8, 0x03, 0xE8, 0x03, 0xE8, 0x03, 0xE8, 0x03, n & 0xFF, 0x00, 0x03, 0x00])
 
 
 def _u16(v: int) -> bytes:
@@ -477,6 +494,62 @@ class V380SnapshotClient:
         except OSError:
             return False
 
+    def send_raw(self, pkt: bytes) -> bool:
+        if not pkt or self._sock is None:
+            return False
+        try:
+            with self._send_lock:
+                self._sock.sendall(pkt)
+            return True
+        except OSError:
+            return False
+
+    def preset_set(self, slot: int) -> bool:
+        ok = self.send_raw(ptz_preset_set_packet(slot))
+        # Alternate action byte used by some firmwares.
+        alt = bytearray(ptz_preset_set_packet(slot))
+        alt[14] = 0x04
+        self.send_raw(bytes(alt))
+        return ok
+
+    def preset_call(self, slot: int) -> bool:
+        ok = self.send_raw(ptz_preset_call_packet(slot))
+        alt = bytearray(ptz_preset_call_packet(slot))
+        alt[14] = 0x05
+        self.send_raw(bytes(alt))
+        time.sleep(0.2)
+        return ok
+
+    def calibrate_ptz(self) -> bool:
+        """Trigger firmware self-check, then a full-speed motor sweep."""
+        if self._sock is None:
+            return False
+        ok = False
+        for name in ("ptz_calibrate", "ptz_calibrate_alt"):
+            try:
+                if self.send_control(name):
+                    ok = True
+            except Exception:
+                pass
+        # Let firmware run its own sweep if it supports the opcode.
+        time.sleep(12.0)
+        steps = (
+            ("ptz_left", 8.0),
+            ("ptz_right", 16.0),
+            ("ptz_left", 8.0),
+            ("ptz_up", 5.0),
+            ("ptz_down", 10.0),
+            ("ptz_up", 5.0),
+        )
+        for cmd, secs in steps:
+            if self.send_control(cmd):
+                ok = True
+                time.sleep(secs)
+            self.send_control("ptz_stop")
+            time.sleep(0.15)
+        self.send_control("ptz_stop")
+        return ok
+
     def start_talk(self) -> bool:
         """Open a second TCP socket and send the V380 speak handshake (cmd 0x179)."""
         self.stop_talk()
@@ -767,29 +840,33 @@ class LiveH264Decoder:
         if not exe:
             raise RuntimeError("FFmpeg not available")
         self.fmt = "hevc" if fmt == "hevc" else "h264"
-        probe = "65536" if self.fmt == "hevc" else "32"
+        # HEVC needs a bit more probe buffer or the first frames go gray.
+        probe = "524288" if self.fmt == "hevc" else "65536"
+        analyze = "500000" if self.fmt == "hevc" else "0"
         cmd = [
             exe,
             "-hide_banner",
             "-loglevel",
             "error",
             "-fflags",
-            "nobuffer",
+            "nobuffer+genpts+discardcorrupt",
             "-flags",
             "low_delay",
             "-probesize",
             probe,
             "-analyzeduration",
-            "0",
+            analyze,
             "-vsync",
             "0",
+            "-threads",
+            str(threads if threads is not None else (2 if self.fmt == "hevc" else 1)),
         ]
-        if threads is not None:
-            cmd.extend(["-threads", str(threads)])
         cmd.extend(["-f", self.fmt, "-i", "pipe:0"])
         if scale_width > 0:
             cmd.extend(["-vf", f"scale={scale_width}:-2"])
-        cmd.extend(["-f", "image2pipe", "-vcodec", "mjpeg", "-q:v", str(jpeg_q), "pipe:1"])
+        # Lower -q:v = sharper JPEG (smoother look on screen)
+        q = max(2, min(8, int(jpeg_q)))
+        cmd.extend(["-f", "image2pipe", "-vcodec", "mjpeg", "-q:v", str(q), "pipe:1"])
         popen_kw: dict = {
             "stdin": subprocess.PIPE,
             "stdout": subprocess.PIPE,
@@ -800,7 +877,7 @@ class LiveH264Decoder:
         self.proc = subprocess.Popen(cmd, **popen_kw)
         self._queue = out_queue
         self._stop = threading.Event()
-        self._in_q: queue.Queue = queue.Queue(maxsize=2)
+        self._in_q: queue.Queue = queue.Queue(maxsize=3)
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._writer = threading.Thread(target=self._write_loop, daemon=True)
         self._reader.start()
@@ -815,14 +892,22 @@ class LiveH264Decoder:
         vps: bytes | None = None,
     ) -> None:
         item = (is_iframe, payload, sps, pps, vps)
-        while True:
+        if is_iframe:
+            # Never drop a keyframe — that causes the gray ghost picture.
+            while True:
+                try:
+                    self._in_q.get_nowait()
+                except queue.Empty:
+                    break
             try:
-                self._in_q.get_nowait()
-            except queue.Empty:
-                break
+                self._in_q.put_nowait(item)
+            except queue.Full:
+                pass
+            return
         try:
             self._in_q.put_nowait(item)
         except queue.Full:
+            # Keep GOP intact — dropping a queued NALu mid-stream causes gray gaps.
             pass
 
     def _write_loop(self) -> None:
@@ -879,6 +964,150 @@ class LiveH264Decoder:
             self.proc.kill()
         except OSError:
             pass
+
+
+class PyAVLiveDecoder:
+    """In-process HEVC/H264 decode via PyAV — much lower latency than an FFmpeg JPEG pipe."""
+
+    def __init__(
+        self,
+        out_queue,
+        fmt: str = "h264",
+        *,
+        scale_width: int = 0,
+        jpeg_q: int = 3,
+        threads: int | None = None,
+        output: str = "rgb",
+    ):
+        import av
+
+        self._av = av
+        self._queue = out_queue
+        self.fmt = "hevc" if fmt == "hevc" else "h264"
+        self.scale_width = int(scale_width or 0)
+        # Map ffmpeg-style q (2=best) to OpenCV JPEG quality.
+        self.jpeg_q = int(max(55, min(92, 100 - max(2, jpeg_q) * 6)))
+        self.output = "jpeg" if str(output).lower() == "jpeg" else "rgb"
+        self._threads = threads
+        self._stop = threading.Event()
+        # Small buffer so HEVC keeps reference frames; UI still shows only the newest picture.
+        self._in_q: queue.Queue = queue.Queue(maxsize=3)
+        self._codec = self._new_codec()
+        self._writer = threading.Thread(target=self._run, daemon=True, name="pyav-dec")
+        self._writer.start()
+
+    def _new_codec(self):
+        codec = self._av.CodecContext.create(self.fmt, "r")
+        # Multi-thread decode keeps up with the camera (single-thread builds lag).
+        try:
+            n = 0 if self._threads is None else int(self._threads)
+            codec.thread_type = "AUTO"
+            codec.thread_count = n
+        except Exception:
+            pass
+        try:
+            codec.options = {"flags": "+low_delay"}
+        except Exception:
+            pass
+        return codec
+
+    def write_frame(
+        self,
+        is_iframe: bool,
+        payload: bytes,
+        sps: bytes | None,
+        pps: bytes | None,
+        vps: bytes | None = None,
+    ) -> None:
+        item = (is_iframe, payload, sps, pps, vps)
+        if is_iframe:
+            # Resync on keyframe — safe to drop stale P-frames here.
+            while True:
+                try:
+                    self._in_q.get_nowait()
+                except queue.Empty:
+                    break
+            try:
+                self._in_q.put_nowait(item)
+            except queue.Full:
+                pass
+            return
+        try:
+            self._in_q.put_nowait(item)
+        except queue.Full:
+            # Do NOT steal a queued frame mid-GOP — that causes gray gaps. Drop this late P-frame.
+            pass
+
+    def _run(self) -> None:
+        import cv2
+        import numpy as np
+
+        while not self._stop.is_set():
+            try:
+                is_iframe, payload, sps, pps, vps = self._in_q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            chunk = payload
+            if is_iframe and self.fmt == "hevc" and vps and sps and pps and not has_hevc_vps(payload):
+                chunk = prepend_hevc_params(payload, vps, sps, pps)
+            elif is_iframe and self.fmt != "hevc" and sps and pps:
+                chunk = prepend_sps_pps(payload, sps, pps)
+            try:
+                packet = self._av.Packet(chunk)
+                frames = self._codec.decode(packet)
+            except Exception:
+                if is_iframe:
+                    try:
+                        self._codec = self._new_codec()
+                        packet = self._av.Packet(chunk)
+                        frames = self._codec.decode(packet)
+                    except Exception:
+                        continue
+                else:
+                    continue
+            for frame in frames:
+                try:
+                    arr = frame.to_ndarray(format="bgr24")
+                except Exception:
+                    continue
+                if self.scale_width > 0 and arr.shape[1] > self.scale_width:
+                    h = max(1, int(arr.shape[0] * (self.scale_width / arr.shape[1])))
+                    arr = cv2.resize(arr, (self.scale_width, h), interpolation=cv2.INTER_AREA)
+                if self.output == "jpeg":
+                    ok, enc = cv2.imencode(".jpg", arr, [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_q])
+                    if not ok:
+                        continue
+                    item = enc.tobytes()
+                else:
+                    # RGB ndarray — skip JPEG encode/decode (sharper + lower lag).
+                    item = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
+                if self._queue.full():
+                    try:
+                        self._queue.get_nowait()
+                    except Exception:
+                        pass
+                try:
+                    self._queue.put_nowait(item)
+                except Exception:
+                    pass
+
+    def close(self) -> None:
+        self._stop.set()
+        try:
+            while True:
+                self._in_q.get_nowait()
+        except queue.Empty:
+            pass
+
+
+def make_live_decoder(out_queue, fmt: str = "h264", **kwargs):
+    """Prefer PyAV (low latency). Fall back to FFmpeg JPEG pipe."""
+    try:
+        import av  # noqa: F401
+
+        return PyAVLiveDecoder(out_queue, fmt=fmt, **kwargs)
+    except Exception:
+        return LiveH264Decoder(out_queue, fmt=fmt, **kwargs)
 
 
 def _pop_jpeg(buf: bytearray) -> bytes | None:

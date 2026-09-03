@@ -10,7 +10,7 @@ from v380.ui.clips import ClipsFrame
 from v380.ui.home import EditDialog, HomeFrame
 from v380.ui.live_view import LiveView
 from v380.ui.login import LoginFrame
-from v380.ui.theme import BG
+from v380.ui.theme import BG, apply_root_style
 
 
 class StudioApp(tk.Tk):
@@ -20,6 +20,7 @@ class StudioApp(tk.Tk):
         self.geometry("1280x780")
         self.minsize(1020, 640)
         self.configure(bg=BG)
+        apply_root_style(self)
 
         self.api = None
         self.store = None
@@ -47,6 +48,7 @@ class StudioApp(tk.Tk):
             self._edit,
             self._show_clips,
             previews=RemotePreview(api, self._preview_state),
+            api=api,
         )
         self._home.pack(fill="both", expand=True)
         self.recorders.sync(self.store.list())
@@ -99,7 +101,7 @@ class StudioApp(tk.Tk):
         self._show_live(cam, auto_connect=True)
 
     def _edit(self, cam: Camera) -> None:
-        EditDialog(self, cam, self._save_edit)
+        EditDialog(self, cam, self._save_edit, api=self.api)
 
     def _save_edit(self, cam: Camera) -> None:
         self.store.update(cam)

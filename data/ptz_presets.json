@@ -1,0 +1,67 @@
+{
+  "testcam": [],
+  "80342739": [
+    {
+      "slot": 1,
+      "id": "slot1",
+      "name": "Preset 1",
+      "pan": 0.885,
+      "tilt": 0.604,
+      "zoom": 0.0,
+      "saved_at": "2026-09-03 14:20:50",
+      "firmware": false
+    },
+    {
+      "slot": 2,
+      "id": "slot2",
+      "name": "Preset 2",
+      "pan": 0.403,
+      "tilt": 0.315,
+      "zoom": 0.0,
+      "saved_at": "2026-09-03 14:30:25",
+      "firmware": false
+    },
+    {
+      "slot": 3,
+      "id": "slot3",
+      "name": "Preset 3",
+      "pan": -5.586,
+      "tilt": 2.884,
+      "zoom": 0.0,
+      "saved_at": "2026-09-03 14:37:23",
+      "firmware": false
+    }
+  ],
+  "101331838": [
+    {
+      "slot": 1,
+      "id": "slot1",
+      "name": "Preset 1",
+      "pan": 0.397,
+      "tilt": -0.08,
+      "zoom": 0.0,
+      "saved_at": "2026-09-03 14:42:08",
+      "firmware": false
+    },
+    {
+      "slot": 2,
+      "id": "slot2",
+      "name": "Preset 2",
+      "pan": -0.806,
+      "tilt": 0.343,
+      "zoom": 0.0,
+      "saved_at": "2026-09-03 14:44:19",
+      "firmware": false
+    },
+    {
+      "slot": 3,
+      "id": "slot3",
+      "name": "Preset 3",
+      "pan": 0.22,
+      "tilt": 1.106,
+      "zoom": 0.0,
+      "saved_at": "2026-09-03 15:03:46",
+      "firmware": false
+    }
+  ]
+}

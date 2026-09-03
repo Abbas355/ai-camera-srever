@@ -320,29 +320,82 @@ class _SharedMic:
             except Exception:
                 pass
 
+    @staticmethod
+    def _input_device_ids(sd) -> list[int | None]:
+        """Prefer a real default mic; never pass PortAudio's invalid -1."""
+        ids: list[int | None] = []
+        try:
+            default = sd.default.device
+            if isinstance(default, (list, tuple)) and default:
+                din = int(default[0])
+            else:
+                din = int(default) if default is not None else -1
+            if din >= 0:
+                ids.append(din)
+        except Exception:
+            pass
+        # Let sounddevice resolve "default" itself when possible.
+        ids.append(None)
+        try:
+            for i, info in enumerate(sd.query_devices()):
+                if int(info.get("max_input_channels") or 0) <= 0:
+                    continue
+                if i not in ids:
+                    ids.append(i)
+        except Exception:
+            pass
+        # Unique, keep order.
+        seen: set = set()
+        out: list[int | None] = []
+        for d in ids:
+            key = "default" if d is None else d
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(d)
+        return out
+
     def _open(self) -> None:
         if self.stream is not None:
             return
         import sounddevice as sd
 
         self._sd = sd
+        devices = self._input_device_ids(sd)
+        if not devices or devices == [None]:
+            # Still try None below; if query failed we may have only None.
+            pass
         last_err: Exception | None = None
-        for rate in (8000, 16000, 44100, 48000):
-            try:
-                stream = sd.RawInputStream(
-                    samplerate=rate,
-                    channels=1,
-                    dtype="int16",
-                    blocksize=max(160, int(rate * 0.02)),
-                    callback=self._cb,
-                )
-                stream.start()
-                self.stream = stream
-                self.rate = rate
-                return
-            except Exception as exc:
-                last_err = exc
-        raise last_err or RuntimeError("microphone blocked")
+        for device in devices:
+            for rate in (8000, 16000, 44100, 48000):
+                try:
+                    kwargs = {
+                        "samplerate": rate,
+                        "channels": 1,
+                        "dtype": "int16",
+                        "blocksize": max(160, int(rate * 0.02)),
+                        "callback": self._cb,
+                    }
+                    if device is not None:
+                        kwargs["device"] = device
+                    stream = sd.RawInputStream(**kwargs)
+                    stream.start()
+                    self.stream = stream
+                    self.rate = rate
+                    return
+                except Exception as exc:
+                    last_err = exc
+                    msg = str(exc).lower()
+                    # Invalid default (-1) — skip other rates for this device pick.
+                    if "device -1" in msg or "querying device" in msg:
+                        break
+        hint = (
+            "No working microphone found. Plug in a mic, set a default input in "
+            "Windows Sound settings, and allow desktop apps to use the microphone."
+        )
+        if last_err is not None:
+            raise RuntimeError(f"{hint}\n({last_err})") from last_err
+        raise RuntimeError(hint)
 
 
 _SHARED_MIC = _SharedMic()
@@ -373,6 +426,14 @@ class Talker:
     def open_mic_settings() -> None:
         if sys.platform == "win32":
             os.startfile("ms-settings:privacy-microphone")
+
+    @staticmethod
+    def open_sound_settings() -> None:
+        if sys.platform == "win32":
+            try:
+                os.startfile("ms-settings:sound")
+            except OSError:
+                os.startfile("ms-settings:privacy-microphone")
 
     def attach(self, client) -> None:
         self._client = client
@@ -408,6 +469,17 @@ class Talker:
     def _open_mic(self) -> None:
         if self._sd is None:
             raise RuntimeError("sounddevice is not installed")
+        # If a previous attempt left a dead stream, reopen.
+        if _SHARED_MIC.stream is not None:
+            try:
+                if not getattr(_SHARED_MIC.stream, "active", True):
+                    try:
+                        _SHARED_MIC.stream.close()
+                    except Exception:
+                        pass
+                    _SHARED_MIC.stream = None
+            except Exception:
+                _SHARED_MIC.stream = None
         _SHARED_MIC.add(self)
         self._rate = _SHARED_MIC.rate
         self._stream = _SHARED_MIC.stream
@@ -700,3 +772,68 @@ def remux_annexb(path: Path | None, fmt: str, timeout: int = 180) -> Path | None
         except Exception:
             pass
     return path
+
+
+def remux_snapshot(path: Path | None, fmt: str = "h264", timeout: int = 120) -> Path | None:
+    """Remux a growing/open annex-B file for playback without deleting the original.
+
+    Writes <stem>.partial.mp4 so the current hour stays watchable while still recording.
+    """
+    if path is None or not path.is_file():
+        return None
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return None
+    if size < 2048:
+        return None
+    fmt = "hevc" if fmt == "hevc" or path.suffix.lower() == ".h265" else "h264"
+    out = path.with_name(path.stem + ".partial.mp4")
+    snap = path.with_name(path.stem + ".snap" + path.suffix)
+    exe = _ffmpeg_exe()
+    if not exe:
+        return out if out.is_file() else None
+    try:
+        with path.open("rb") as src, snap.open("wb") as dst:
+            while True:
+                chunk = src.read(1024 * 1024)
+                if not chunk:
+                    break
+                dst.write(chunk)
+        kwargs = {
+            "timeout": timeout,
+            "check": False,
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+        }
+        kwargs.update(_win_hide_kwargs())
+        subprocess.run(
+            [
+                exe,
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                fmt,
+                "-i",
+                str(snap),
+                "-c",
+                "copy",
+                "-movflags",
+                "+faststart",
+                str(out),
+            ],
+            **kwargs,
+        )
+    except Exception:
+        return out if out.is_file() and out.stat().st_size > 1024 else None
+    finally:
+        try:
+            snap.unlink(missing_ok=True)
+        except OSError:
+            pass
+    if out.is_file() and out.stat().st_size > 1024:
+        return out
+    return None

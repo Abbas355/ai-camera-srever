@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
+import socket
 import struct
+import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -11,10 +15,149 @@ import urllib.request
 from dataclasses import fields
 from pathlib import Path
 
-from v380.paths import DATA_DIR
+from v380.paths import DATA_DIR, ROOT
 from v380.store.camera_store import Camera
 
 SERVER_FILE = DATA_DIR / "server.txt"
+LOCAL_HOST = "127.0.0.1"
+LOCAL_PORT = 8080
+LOCAL_PORTS = (8080, 18080, 18081, 18082)
+_CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+def _port_open(host: str, port: int, timeout: float = 0.4) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _local_addr(port: int) -> str:
+    return LOCAL_HOST if port == LOCAL_PORT else f"{LOCAL_HOST}:{port}"
+
+
+def _studio_alive(host: str, port: int) -> bool:
+    """True only if this is the V380 studio API (not some other app on the port)."""
+    try:
+        with urllib.request.urlopen(f"http://{host}:{port}/api/ping", timeout=1.5) as resp:
+            data = json.loads(resp.read().decode("utf-8") or "{}")
+        return bool(data.get("ok") and data.get("app") == "v380-studio")
+    except Exception:
+        return False
+
+
+def ensure_local_server(timeout: float = 15.0) -> str:
+    """Make sure the studio API is listening on this PC; start it if needed."""
+    for port in LOCAL_PORTS:
+        if _studio_alive(LOCAL_HOST, port):
+            return _local_addr(port)
+
+    script = ROOT / "clip_server.py"
+    if not script.is_file():
+        raise RuntimeError(f"Missing local server script: {script}")
+
+    port = next((p for p in LOCAL_PORTS if not _port_open(LOCAL_HOST, p)), None)
+    if port is None:
+        raise RuntimeError(
+            f"Ports {', '.join(str(p) for p in LOCAL_PORTS)} are busy with other apps. "
+            "Free one of them, or stop the other service on 8080."
+        )
+
+    _spawn_local_server(port)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _studio_alive(LOCAL_HOST, port):
+            return _local_addr(port)
+        time.sleep(0.25)
+    raise RuntimeError(
+        f"Local studio server did not start on {LOCAL_HOST}:{port}. "
+        "Try: python clip_server.py"
+    )
+
+
+def _spawn_local_server(port: int) -> None:
+    script = ROOT / "clip_server.py"
+    env = {**os.environ, "V380_PORT": str(port)}
+    kwargs: dict = {
+        "cwd": str(ROOT),
+        "env": env,
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+    }
+    if sys.platform == "win32":
+        kwargs["creationflags"] = _CREATE_NO_WINDOW
+    else:
+        kwargs["start_new_session"] = True
+    subprocess.Popen([sys.executable, str(script)], **kwargs)
+
+
+def _pids_listening(port: int) -> list[int]:
+    pids: list[int] = []
+    try:
+        if sys.platform == "win32":
+            out = subprocess.check_output(
+                ["cmd", "/c", f'netstat -ano | findstr ":{port}" | findstr LISTENING'],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+            for line in out.splitlines():
+                parts = line.split()
+                if parts:
+                    try:
+                        pids.append(int(parts[-1]))
+                    except ValueError:
+                        pass
+        else:
+            out = subprocess.check_output(
+                ["sh", "-c", f"lsof -tiTCP:{port} -sTCP:LISTEN 2>/dev/null || true"],
+                text=True,
+            )
+            for part in out.split():
+                try:
+                    pids.append(int(part))
+                except ValueError:
+                    pass
+    except Exception:
+        return []
+    return sorted(set(pids))
+
+
+def stop_local_studio() -> None:
+    """Stop V380 studio processes we started on known local ports."""
+    for port in LOCAL_PORTS:
+        if not _studio_alive(LOCAL_HOST, port):
+            continue
+        for pid in _pids_listening(port):
+            try:
+                if sys.platform == "win32":
+                    subprocess.run(
+                        ["taskkill", "/PID", str(pid), "/F"],
+                        capture_output=True,
+                        check=False,
+                    )
+                else:
+                    os.kill(pid, 15)
+            except Exception:
+                pass
+        time.sleep(0.3)
+
+
+def restart_local_server(timeout: float = 18.0) -> str:
+    """Kill any local V380 studio instance and start a fresh one."""
+    stop_local_studio()
+    time.sleep(0.4)
+    port = next((p for p in LOCAL_PORTS if not _port_open(LOCAL_HOST, p)), None)
+    if port is None:
+        raise RuntimeError("No free local port for studio server.")
+    _spawn_local_server(port)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _studio_alive(LOCAL_HOST, port):
+            return _local_addr(port)
+        time.sleep(0.25)
+    raise RuntimeError("Local studio server did not restart. Try: python clip_server.py")
 
 
 def camera_from_dict(data: dict) -> Camera:
@@ -53,8 +196,11 @@ class StudioAPI:
 
     def save_host(self) -> None:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
-        host = self.base.replace("http://", "").replace("https://", "")
-        SERVER_FILE.write_text(host.split(":")[0], encoding="utf-8")
+        host = self.base.replace("http://", "").replace("https://", "").rstrip("/")
+        # Keep host:port when not the default so local fallback ports survive restart.
+        if host.endswith(":8080"):
+            host = host[: -len(":8080")]
+        SERVER_FILE.write_text(host, encoding="utf-8")
 
     def headers(self, extra: dict | None = None) -> dict:
         hdrs = {"Content-Type": "application/json"}
@@ -106,6 +252,23 @@ class StudioAPI:
         self.save_host()
         return out
 
+    def update_profile(
+        self,
+        *,
+        current_password: str,
+        username: str | None = None,
+        new_password: str | None = None,
+    ) -> dict:
+        body = {"current_password": current_password}
+        if username is not None:
+            body["username"] = username
+        if new_password:
+            body["new_password"] = new_password
+        out = self.request("POST", "/api/profile", body)
+        if out.get("user"):
+            self.user = str(out["user"])
+        return out
+
     def cameras(self) -> list[Camera]:
         out = self.request("GET", "/api/cameras")
         return [camera_from_dict(row) for row in (out.get("cameras") or [])]
@@ -144,6 +307,24 @@ class StudioAPI:
         out = self.request("GET", "/api/discover", timeout=20)
         return list(out.get("devices") or [])
 
+    def camera_ping(self, camera_id: int) -> dict:
+        return self.request("GET", f"/api/cameras/{camera_id}/ping", timeout=20)
+
+    def probe_camera(self, fields: dict) -> dict:
+        """Check camera reachability + login without saving."""
+        body = {
+            "name": fields.get("name") or fields.get("device_id") or "",
+            "device_id": fields.get("device_id") or "",
+            "mac": fields.get("mac") or "",
+            "ip": fields.get("ip") or "",
+            "port": int(fields.get("port") or 8800),
+            "username": fields.get("username") or "",
+            "password": fields.get("password") or "",
+            "source": fields.get("source") or "lan",
+            "quality": int(fields.get("quality") if fields.get("quality") is not None else 1),
+        }
+        return self.request("POST", "/api/cameras/probe", body, timeout=20)
+
     def snapshot(self, camera_id: int) -> bytes | None:
         try:
             out = self.request("GET", f"/api/cameras/{camera_id}/snapshot", timeout=8)
@@ -151,8 +332,15 @@ class StudioAPI:
             return None
         return out if isinstance(out, (bytes, bytearray)) else None
 
-    def command(self, camera_id: int, name: str) -> bool:
-        out = self.request("POST", f"/api/cameras/{camera_id}/command", {"name": name}, timeout=3)
+    def command(self, camera_id: int, name: str, hold: float = 0.0) -> bool:
+        hold = float(hold or 0)
+        timeout = max(8.0, hold + 5.0) if hold > 0 else (8 if str(name).startswith(("ptz_calibrate", "preset_")) else 3)
+        out = self.request(
+            "POST",
+            f"/api/cameras/{camera_id}/command",
+            {"name": name, "hold": hold},
+            timeout=timeout,
+        )
         return bool(out.get("ok"))
 
     def talk_start(self, camera_id: int) -> bool:
@@ -286,6 +474,9 @@ class RemoteCameraStore:
 
     def delete(self, camera_id: int) -> None:
         self.api.delete(camera_id)
+
+    def ping(self, camera_id: int) -> dict:
+        return self.api.camera_ping(camera_id)
 
     def set_status(self, *args, **kwargs) -> None:
         return None

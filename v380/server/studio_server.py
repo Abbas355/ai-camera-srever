@@ -20,7 +20,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 from v380.paths import DATA_DIR, REC_DIR, ROOT as APP_DIR
-PORT = 8080
+PORT = int(os.environ.get("V380_PORT", "8080"))
 VIDEO_EXT = {".mp4", ".h264", ".h265"}
 TOKEN_TTL = 7 * 24 * 3600
 DEFAULT_USER = os.environ.get("V380_ADMIN_USER", "admin")
@@ -58,7 +58,7 @@ def load_mods() -> dict:
         "relay": pick(ex, "get_relay_ip", "get_relay_ip"),
         "Alert": pick(ex, "AlertSiren", "AlertSiren"),
         "Client": pick(vc, "V380SnapshotClient", "V380SnapshotClient"),
-        "Decoder": pick(vc, "LiveH264Decoder", "LiveH264Decoder"),
+        "Decoder": pick(vc, "make_live_decoder", "LiveH264Decoder", "LiveH264Decoder"),
         "read_status": pick(ar, "read_worker_status", "read_worker_status"),
         "ensure_worker": pick(ar, "ensure_worker", "ensure_worker"),
     }
@@ -92,6 +92,90 @@ def cam_json(cam) -> dict:
         "quality_name": str(cam_get(cam, "quality_name", "quality_name", default="HD")),
         "source_name": str(cam_get(cam, "source_name", "source_name", default="LAN")),
     }
+
+
+def ping_camera(cam) -> dict:
+    """TCP + login probe so the UI can tell if a camera is online."""
+    t0 = time.time()
+    Client = MODS["Client"]
+    relay = MODS["relay"]
+    device_id = int(cam_get(cam, "device_id", "device_id") or 0)
+    source = str(cam_get(cam, "source", default="lan") or "lan")
+    port = int(cam_get(cam, "port", default=8800) or 8800)
+    host = str(cam_get(cam, "ip", default="") or "")
+    if source == "cloud" and relay:
+        try:
+            host = relay(device_id) or ""
+        except Exception as exc:
+            return {
+                "ok": False,
+                "reachable": False,
+                "online": False,
+                "error": f"Relay lookup failed: {exc}",
+                "ms": int((time.time() - t0) * 1000),
+            }
+        if not host:
+            return {
+                "ok": False,
+                "reachable": False,
+                "online": False,
+                "error": "No cloud relay",
+                "ms": int((time.time() - t0) * 1000),
+            }
+    if not host:
+        return {
+            "ok": False,
+            "reachable": False,
+            "online": False,
+            "error": "No camera IP",
+            "ms": int((time.time() - t0) * 1000),
+        }
+    try:
+        with socket.create_connection((host, port), timeout=3):
+            pass
+    except OSError as exc:
+        return {
+            "ok": False,
+            "reachable": False,
+            "online": False,
+            "host": host,
+            "port": port,
+            "error": str(exc),
+            "ms": int((time.time() - t0) * 1000),
+        }
+    client = None
+    try:
+        client = Client(
+            host,
+            device_id,
+            cam_get(cam, "username", default="") or "",
+            cam_get(cam, "password", default="") or "",
+            port,
+            quality=1,
+            source=source,
+        )
+        call(client, "connect", "connect")
+        return {
+            "ok": True,
+            "reachable": True,
+            "online": True,
+            "host": host,
+            "port": port,
+            "ms": int((time.time() - t0) * 1000),
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "reachable": True,
+            "online": False,
+            "host": host,
+            "port": port,
+            "error": str(exc),
+            "ms": int((time.time() - t0) * 1000),
+        }
+    finally:
+        if client is not None:
+            call(client, "close", "close")
 
 
 def hash_pw(password: str, salt: bytes) -> bytes:
@@ -131,6 +215,67 @@ def check_user(username: str, password: str) -> bool:
     if not row:
         return False
     return secrets.compare_digest(hash_pw(password, bytes(row["pass_salt"])), bytes(row["pass_hash"]))
+
+
+def update_profile(
+    current_user: str,
+    *,
+    current_password: str,
+    new_username: str | None = None,
+    new_password: str | None = None,
+) -> dict:
+    """Change studio login username and/or password. Requires current password."""
+    user = (current_user or "").strip()
+    if not user:
+        raise RuntimeError("Not logged in")
+    if not check_user(user, current_password or ""):
+        raise RuntimeError("Current password is wrong")
+
+    want_user = (new_username or "").strip() or user
+    want_pass = new_password if new_password is not None else ""
+    change_user = want_user != user
+    change_pass = bool(want_pass)
+
+    if not change_user and not change_pass:
+        raise RuntimeError("Nothing to update")
+    if change_user:
+        if len(want_user) < 3:
+            raise RuntimeError("Username must be at least 3 characters")
+        if any(ch.isspace() for ch in want_user):
+            raise RuntimeError("Username cannot contain spaces")
+        taken = STORE._conn.execute(
+            "SELECT id FROM users WHERE username = ? AND username != ?",
+            (want_user, user),
+        ).fetchone()
+        if taken:
+            raise RuntimeError("That username is already taken")
+    if change_pass and len(want_pass) < 4:
+        raise RuntimeError("New password must be at least 4 characters")
+
+    row = STORE._conn.execute("SELECT id FROM users WHERE username = ?", (user,)).fetchone()
+    if not row:
+        raise RuntimeError("User not found")
+
+    if change_pass:
+        salt = os.urandom(16)
+        STORE._conn.execute(
+            "UPDATE users SET username = ?, pass_salt = ?, pass_hash = ? WHERE id = ?",
+            (want_user, salt, hash_pw(want_pass, salt), row["id"]),
+        )
+    elif change_user:
+        STORE._conn.execute(
+            "UPDATE users SET username = ? WHERE id = ?",
+            (want_user, row["id"]),
+        )
+    STORE._conn.commit()
+
+    if change_user:
+        with _sessions_lock:
+            for rec in _sessions.values():
+                if rec.get("user") == user:
+                    rec["user"] = want_user
+
+    return {"ok": True, "user": want_user, "username_changed": change_user, "password_changed": change_pass}
 
 
 def new_token(username: str) -> str:
@@ -249,6 +394,7 @@ class Session:
         self._subs: list[queue.Queue] = []
         self._sub_lock = threading.Lock()
         self._jpeg_n = 0
+        self._need_keyframe = False
         self._thread = threading.Thread(target=self._run, daemon=True, name=f"hub-{cam.id}")
 
     def start(self) -> None:
@@ -306,12 +452,27 @@ class Session:
                         fmt = pick(client, "video_codec", "video_codec", default="h264") or "h264"
                         self.codec = fmt
                         try:
-                            decoder = Decoder(frames, fmt=fmt, scale_width=1280, jpeg_q=5, threads=1)
+                            decoder = Decoder(frames, fmt=fmt, scale_width=1280, jpeg_q=3, threads=2, output="jpeg")
                         except TypeError:
-                            decoder = Decoder(frames, fmt=fmt)
+                            try:
+                                decoder = Decoder(frames, fmt=fmt, scale_width=1280, jpeg_q=3, threads=2)
+                            except TypeError:
+                                decoder = Decoder(frames, fmt=fmt)
                     if is_iframe:
                         got_key = True
+                        if self._need_keyframe:
+                            if decoder is not None:
+                                call(decoder, "close", "close")
+                            try:
+                                decoder = Decoder(
+                                    frames, fmt=self.codec, scale_width=1280, jpeg_q=3, threads=2, output="jpeg"
+                                )
+                            except TypeError:
+                                decoder = Decoder(frames, fmt=self.codec)
+                            self._need_keyframe = False
                     if not got_key:
+                        continue
+                    if self._need_keyframe and not is_iframe:
                         continue
                     rec = payload
                     prep = pick(client, "h264_for_decode", "h264_for_decode")
@@ -321,7 +482,8 @@ class Session:
                     self._jpeg_n += 1
                     with self._sub_lock:
                         live_watchers = bool(self._subs)
-                    if (not live_watchers) or is_iframe or self._jpeg_n % 8 == 0:
+                    # Decode every frame while someone is watching — smoother live, fewer gray glitches.
+                    if live_watchers or is_iframe or self._jpeg_n % 3 == 0:
                         write = pick(decoder, "write_frame", "write_frame")
                         if write:
                             write(
@@ -386,9 +548,52 @@ class Session:
             except queue.Full:
                 pass
 
-    def command(self, name: str) -> bool:
+    def command(self, name: str, hold: float = 0.0) -> bool:
+        # Wait briefly — live session may still be connecting.
+        for _ in range(50):
+            if self._client is not None:
+                break
+            time.sleep(0.05)
         if self._client is None:
             return False
+        if str(name) == "ptz_calibrate":
+            call(self._client, "send_control", "send_control", args=("ptz_calibrate",), default=False)
+            call(self._client, "send_control", "send_control", args=("ptz_calibrate_alt",), default=False)
+            self._need_keyframe = True
+            return True
+        if str(name).startswith("preset_set_"):
+            try:
+                slot = int(str(name).split("_")[-1])
+            except ValueError:
+                return False
+            fn = pick(self._client, "preset_set", "preset_set")
+            return bool(fn(slot)) if callable(fn) else False
+        if str(name).startswith("preset_call_"):
+            try:
+                slot = int(str(name).split("_")[-1])
+            except ValueError:
+                return False
+            fn = pick(self._client, "preset_call", "preset_call")
+            return bool(fn(slot)) if callable(fn) else False
+
+        hold = max(0.0, min(30.0, float(hold or 0.0)))
+        if hold > 0.05 and str(name).startswith("ptz_") and str(name) != "ptz_stop":
+            # Keepalive on the live socket — V380 motors stop if START is not refreshed.
+            ok = bool(call(self._client, "send_control", "send_control", args=(name,), default=False))
+            if not ok:
+                return False
+            deadline = time.time() + hold
+            while time.time() < deadline:
+                time.sleep(min(0.28, max(0.0, deadline - time.time())))
+                if time.time() >= deadline:
+                    break
+                call(self._client, "send_control", "send_control", args=(name,), default=False)
+            call(self._client, "send_control", "send_control", args=("ptz_stop",), default=False)
+            self._need_keyframe = True
+            return True
+
+        if str(name) == "ptz_stop":
+            self._need_keyframe = True
         return bool(call(self._client, "send_control", "send_control", args=(name,), default=False))
 
     def talk_start(self) -> bool:
@@ -600,6 +805,13 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 self.send_json({"ok": True, "camera": cam_json(cam)})
                 return
+            if parts[1] == "ping":
+                cam = call(STORE, "get", "get", args=(cam_id,))
+                if cam is None:
+                    self.send_json({"ok": False, "error": "missing"}, 404)
+                    return
+                self.send_json(ping_camera(cam))
+                return
             if parts[1] == "snapshot":
                 jpeg = HUB.snapshot(cam_id)
                 for _ in range(40):
@@ -691,6 +903,25 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not self.need_user():
             return
+        if path == "/api/profile":
+            body = self.read_json()
+            me = auth_user(self.token()) or ""
+            try:
+                out = update_profile(
+                    me,
+                    current_password=str(body.get("current_password") or body.get("password") or ""),
+                    new_username=str(body.get("username") or body.get("new_username") or "").strip() or None,
+                    new_password=str(body.get("new_password") or "") or None,
+                )
+            except RuntimeError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, 400)
+                return
+            self.send_json(out)
+            return
+        if path == "/api/cameras/probe":
+            cam = camera_from_body(self.read_json())
+            self.send_json(ping_camera(cam))
+            return
         if path == "/api/cameras":
             saved = call(STORE, "upsert", "upsert", args=(camera_from_body(self.read_json()),))
             self.kick_record()
@@ -716,8 +947,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": "missing camera"}, 404)
                 return
             if len(parts) == 2 and parts[1] == "command":
-                name = str(self.read_json().get("name") or "")
-                self.send_json({"ok": ses.command(name), "name": name})
+                body = self.read_json()
+                name = str(body.get("name") or "")
+                hold = float(body.get("hold") or 0)
+                self.send_json({"ok": ses.command(name, hold=hold), "name": name, "hold": hold})
                 return
             if parts[-2:] == ["talk", "start"]:
                 self.send_json({"ok": ses.talk_start()})

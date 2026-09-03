@@ -15,7 +15,21 @@ from tkinter import messagebox, ttk
 
 from v380.paths import DATA_DIR, REC_DIR
 from v380.record.auto_record import rename_legacy_names
-from v380.ui.theme import ACCENT, BG, CARD, MUTED, TEXT, TILE
+from v380.ui.profile import open_profile
+from v380.ui.theme import (
+    ACCENT,
+    BG,
+    BORDER,
+    CARD,
+    FONT_HEAD,
+    FONT_SMALL,
+    MUTED,
+    TEXT,
+    TILE,
+    ghost_button,
+    primary_button,
+    status_bar,
+)
 from v380.client.v380_client import _ffmpeg_exe, _win_hide_kwargs
 
 CACHE_DIR = DATA_DIR / "clip_cache"
@@ -32,9 +46,68 @@ def _play_file(path: Path) -> None:
     subprocess.Popen([opener, str(path)], start_new_session=True)
 
 
+def _base_stem(path) -> str:
+    stem = str(getattr(path, "stem", "") or "")
+    if stem.endswith(".partial"):
+        return stem[: -len(".partial")]
+    return stem
+
+
+def _is_partial(path) -> bool:
+    name = str(getattr(path, "name", "") or "").lower()
+    return name.endswith(".partial.mp4")
+
+
+def _play_rank(path) -> int:
+    """Lower = better for playback. Finished mp4 > mid-hour partial > raw."""
+    if _is_partial(path):
+        return 1
+    suf = str(getattr(path, "suffix", "") or "").lower()
+    if suf == ".mp4":
+        return 0
+    return 2
+
+
+def _clip_slot_key(path) -> str:
+    stem = _base_stem(path)
+    parent = str(getattr(getattr(path, "parent", None), "name", "") or "")
+    if _HH.match(parent) and (_HH.match(stem) or stem.isdigit()):
+        return f"{parent}/{stem}"
+    return stem
+
+
+def _dedupe_clips(clips: list) -> list:
+    best: dict[str, object] = {}
+    order: list[str] = []
+    for path in clips:
+        key = _clip_slot_key(path)
+        if key not in best:
+            best[key] = path
+            order.append(key)
+            continue
+        if _play_rank(path) < _play_rank(best[key]):
+            best[key] = path
+    return [best[k] for k in order]
+
+
 def _to_mp4(src: Path) -> Path:
     if src.suffix.lower() == ".mp4":
         return src
+    # Open hourly files must stay raw — never remux to <hour>.mp4 while recording.
+    if src.suffix.lower() in (".h264", ".h265"):
+        from v380.client.extras import remux_snapshot
+
+        fmt = "hevc" if src.suffix.lower() == ".h265" else "h264"
+        got = remux_snapshot(src, fmt)
+        if got is not None:
+            return got
+        partial = src.with_name(src.stem + ".partial.mp4")
+        if partial.is_file() and partial.stat().st_size > 1024:
+            return partial
+        raise RuntimeError(
+            "This hour is still recording. Wait about 1 minute after Rec starts, "
+            "then press Refresh and play the orange “Recording…” clip."
+        )
     dest = src.with_suffix(".mp4")
     if dest.is_file() and dest.stat().st_size > 1024:
         return dest
@@ -51,6 +124,9 @@ def _to_mp4(src: Path) -> Path:
     )
     return dest if dest.is_file() and dest.stat().st_size > 1024 else src
 
+
+def _ensure_playable(src: Path) -> Path:
+    return _to_mp4(src)
 
 def _cache_remote(ref) -> Path:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -104,6 +180,7 @@ def _index_remote(base: str, token: str = "") -> dict[str, dict[str, list]]:
     for cam, dates in (payload.get("cameras") or {}).items():
         for day, items in dates.items():
             clips = [ClipRef(it["rel"], int(it.get("size") or 0), base.rstrip("/"), token) for it in items]
+            clips = _dedupe_clips(clips)
             clips.sort(key=lambda c: _clip_when(c))
             cameras.setdefault(cam, {})[day] = clips
     return cameras
@@ -118,16 +195,16 @@ def _size_text(n: int) -> str:
 
 
 def _clip_when(path: Path) -> str:
-    stem = path.stem.replace("_", "-")
+    stem = _base_stem(path).replace("_", "-")
     parts = stem.split("-")
+    parent = str(getattr(getattr(path, "parent", None), "name", "") or "")
     if len(parts) >= 3 and all(p.isdigit() for p in parts[:3]):
         return f"{parts[0]}:{parts[1]}:{parts[2]}"
-    if _HH.match(stem) and _HH.match(path.parent.name):
-        return f"{path.parent.name}:{stem}:00"
+    if _HH.match(stem) and _HH.match(parent):
+        return f"{parent}:{stem}:00"
     if _HH.match(stem):
         return f"{stem}:00:00"
-    return path.stem
-
+    return _base_stem(path)
 
 def _hour_of(path: Path) -> str:
     when = _clip_when(path)
@@ -152,8 +229,10 @@ def _index(root: Path) -> dict[str, dict[str, list[Path]]]:
         date = parts[1] if len(parts) >= 3 else "other"
         data.setdefault(camera, {}).setdefault(date, []).append(path)
     for dates in data.values():
-        for files in dates.values():
+        for day, files in list(dates.items()):
+            files = _dedupe_clips(files)
             files.sort(key=lambda p: _clip_when(p))
+            dates[day] = files
     return data
 
 
@@ -172,39 +251,48 @@ class ClipsFrame(tk.Frame):
         self._remote = api.base if api is not None else ""
         self._token = api.token if api is not None else ""
 
-        top = tk.Frame(self, bg=CARD, padx=16, pady=12)
+        top = tk.Frame(self, bg=CARD, padx=18, pady=12, highlightthickness=1, highlightbackground=BORDER)
         top.pack(fill="x")
-        tk.Button(top, text="← Home", bg="#334155", fg="white", relief="flat", command=self._on_back).pack(side="left")
-        tk.Label(top, text="  Playback", fg="white", bg=CARD, font=("Segoe UI", 16, "bold")).pack(side="left", padx=(12, 0))
-        tk.Button(top, text="Refresh", bg="#334155", fg="white", relief="flat", command=self.reload).pack(side="right")
-        tk.Label(top, text="Server IP", fg=MUTED, bg=CARD).pack(side="right", padx=(0, 8))
+        ghost_button(top, "← Home", self._on_back).pack(side="left")
+        brand = tk.Frame(top, bg=CARD)
+        brand.pack(side="left", padx=(12, 0))
+        tk.Label(brand, text="Playback", fg=TEXT, bg=CARD, font=FONT_HEAD).pack(anchor="w")
+        tk.Label(brand, text="Recordings by camera and day", fg=MUTED, bg=CARD, font=FONT_SMALL).pack(anchor="w")
+        ghost_button(top, "Refresh", self.reload).pack(side="right")
+        ghost_button(top, "Profile", self._open_profile).pack(side="right", padx=(0, 8))
+        tk.Label(top, text="Server IP", fg=MUTED, bg=CARD, font=FONT_SMALL).pack(side="right", padx=(0, 8))
         self._server_var = tk.StringVar()
         if api is not None:
             self._server_var.set(api.base.replace("http://", "").replace("https://", "").split(":")[0])
         elif SERVER_FILE.is_file():
             self._server_var.set(SERVER_FILE.read_text(encoding="utf-8").strip())
-        tk.Entry(top, textvariable=self._server_var, width=16, bg="#1f2937", fg=TEXT, insertbackground=TEXT, relief="flat").pack(
-            side="right", padx=(0, 8)
-        )
-        tk.Button(top, text="This PC", bg="#334155", fg="white", relief="flat", command=self._use_pc).pack(
-            side="right", padx=(0, 8)
-        )
-        tk.Button(top, text="Connect", bg=ACCENT, fg="white", relief="flat", command=self._use_server).pack(
-            side="right", padx=(0, 8)
-        )
+        tk.Entry(
+            top,
+            textvariable=self._server_var,
+            width=16,
+            bg=TILE,
+            fg=TEXT,
+            insertbackground=TEXT,
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground=BORDER,
+            highlightcolor=ACCENT,
+        ).pack(side="right", padx=(0, 8), ipady=4)
+        ghost_button(top, "This PC", self._use_pc).pack(side="right", padx=(0, 8))
+        primary_button(top, "Connect", self._use_server).pack(side="right", padx=(0, 8))
 
-        pick = tk.Frame(self, bg=CARD, padx=16, pady=12)
+        pick = tk.Frame(self, bg=CARD, padx=18, pady=12)
         pick.pack(fill="x")
-        tk.Label(pick, text="Camera", fg=MUTED, bg=CARD).pack(side="left")
+        tk.Label(pick, text="Camera", fg=MUTED, bg=CARD, font=FONT_SMALL).pack(side="left")
         self._cam_var = tk.StringVar()
         self._cam_box = ttk.Combobox(pick, textvariable=self._cam_var, state="readonly", width=28, font=("Segoe UI", 11))
         self._cam_box.pack(side="left", padx=(8, 24))
         self._cam_box.bind("<<ComboboxSelected>>", lambda _e: self._pick_camera())
-        tk.Label(pick, text="Day", fg=MUTED, bg=CARD).pack(side="left")
+        tk.Label(pick, text="Day", fg=MUTED, bg=CARD, font=FONT_SMALL).pack(side="left")
         self._dates_row = tk.Frame(pick, bg=CARD)
         self._dates_row.pack(side="left", fill="x", expand=True, padx=(8, 0))
 
-        self.status = tk.Label(self, text="", anchor="w", fg=TEXT, bg="#1e2937", padx=16, pady=8)
+        self.status = status_bar(self)
         self.status.pack(fill="x")
 
         body = tk.Frame(self, bg=BG)
@@ -252,6 +340,9 @@ class ClipsFrame(tk.Frame):
         self._remote = ip if "://" in ip else f"http://{ip}:8080"
         self._token = getattr(self._api, "token", "") if self._api is not None else ""
         self.reload()
+
+    def _open_profile(self) -> None:
+        open_profile(self, self._api, self.status)
 
     def reload(self) -> None:
         keep_cam, keep_date, keep_hour = self._camera, self._date, self._hour
@@ -348,7 +439,12 @@ class ClipsFrame(tk.Frame):
                     pass
             row = tk.Frame(self._hours_inner, bg=CARD)
             row.pack(fill="x", padx=8, pady=4)
-            label = f"  {hour}:00     {len(files)} clip(s)     {_size_text(size)}  "
+            live = any(_is_partial(p) or str(getattr(p, "suffix", "")).lower() in (".h264", ".h265") for p in files)
+            label = f"  {hour}:00     {len(files)} clip(s)     {_size_text(size)}"
+            if live:
+                label += "     Recording…  "
+            else:
+                label += "  "
             b = tk.Button(
                 row,
                 text=label,
@@ -360,13 +456,14 @@ class ClipsFrame(tk.Frame):
                 command=lambda h=hour: self._pick_hour(h),
             )
             b.pack(side="left", fill="x", expand=True)
+            best = sorted(files, key=_play_rank)[0]
             tk.Button(
                 row,
-                text="Play",
-                bg=ACCENT,
+                text="Play so far" if live else "Play",
+                bg="#c2410c" if live else ACCENT,
                 fg="white",
                 relief="flat",
-                command=lambda h=hour: self._play_path(self._hour_files[h][0]),
+                command=lambda p=best: self._play_path(p),
             ).pack(side="right", padx=6, pady=4)
             self._hour_btns[hour] = b
         hour = prefer_hour if prefer_hour in keys else keys[0]
@@ -389,15 +486,18 @@ class ClipsFrame(tk.Frame):
         grid.pack(fill="both", expand=True)
         for i, path in enumerate(files):
             when = _clip_when(path)[3:5] if len(_clip_when(path)) >= 5 else _clip_when(path)
-            ready = path.suffix.lower() == ".mp4"
+            ready = str(getattr(path, "suffix", "")).lower() == ".mp4"
+            live = _is_partial(path) or not ready
             title = f"{hour}:{when}" if len(when) == 2 else _clip_when(path)
-            if not ready:
+            if _is_partial(path):
+                title = f"{hour} so far"
+            elif not ready:
                 title += " …"
             b = tk.Button(
                 grid,
                 text=title,
-                width=8,
-                bg="#1e2937" if ready else "#7f1d1d",
+                width=10,
+                bg="#c2410c" if live else "#1e2937",
                 fg="white",
                 relief="flat",
                 command=lambda p=path: self._play_path(p),
@@ -405,6 +505,14 @@ class ClipsFrame(tk.Frame):
             b.grid(row=i // 6, column=i % 6, padx=4, pady=4, sticky="ew")
         if not files:
             tk.Label(self._mins, text="No clips in this hour.", fg=MUTED, bg=TILE).pack(anchor="w")
+        elif any(_is_partial(p) or str(getattr(p, "suffix", "")).lower() in (".h264", ".h265") for p in files):
+            tk.Label(
+                self._mins,
+                text="Orange = still recording. Play so far opens what’s written (~last 10–15 min after each refresh).",
+                fg=MUTED,
+                bg=TILE,
+                font=FONT_SMALL,
+            ).pack(anchor="w", pady=(8, 0))
 
     def _clear_hours(self) -> None:
         for child in self._hours_inner.winfo_children():
@@ -424,15 +532,22 @@ class ClipsFrame(tk.Frame):
         if not path.is_file():
             messagebox.showinfo("Playback", "That clip is not on disk yet.")
             return
+        self.status.configure(text="Preparing clip…")
+        threading.Thread(target=self._play_local, args=(path,), daemon=True).start()
+
+    def _play_local(self, path: Path) -> None:
         try:
-            _play_file(path)
+            play = _ensure_playable(path)
+            _play_file(play)
+            msg = "Playing recording so far (hour still open)." if _is_partial(play) or _is_partial(path) else "Playing in the Windows player."
+            self.after(0, lambda: self.status.configure(text=msg))
         except Exception as exc:
-            messagebox.showerror("Play failed", str(exc))
+            self.after(0, lambda: messagebox.showerror("Play failed", str(exc)))
 
     def _play_remote(self, ref) -> None:
         try:
             local = _cache_remote(ref)
-            play = _to_mp4(local)
+            play = _ensure_playable(local)
             _play_file(play)
             self.after(0, lambda: self.status.configure(text="Playing in the Windows player (not the browser)."))
         except Exception as exc:

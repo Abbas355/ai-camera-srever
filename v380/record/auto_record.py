@@ -316,6 +316,11 @@ def wait_remux(timeout: float = 180.0) -> None:
 class _ChunkWriter:
     """Writes one stable slot file. Splits on the first I-frame after the clock."""
 
+    # While an hour file is still open, refresh a playable .partial.mp4 so users can
+    # watch the last ~10–15 minutes without waiting for the hour to finish.
+    PARTIAL_EVERY_SEC = 5 * 60
+    PARTIAL_FIRST_SEC = 60
+
     def __init__(self, cam: Camera, rec_dir: Path | None = None, remux=None):
         self._cam = cam
         self._rec_dir = rec_dir
@@ -326,6 +331,8 @@ class _ChunkWriter:
         self._fmt = "h264"
         self._until = _now()
         self._bytes = 0
+        self._opened_at = 0.0
+        self._last_partial = 0.0
 
     def feed(self, now: datetime, fmt: str, is_iframe: bool, annexb: bytes) -> None:
         if not annexb:
@@ -342,6 +349,7 @@ class _ChunkWriter:
             self.close()
             self._open(now, want)
         self._write(annexb)
+        self._maybe_partial()
 
     def _open(self, now: datetime, fmt: str) -> None:
         day, hour, minute, until = _chunk_stamp(now, self._mode)
@@ -352,6 +360,9 @@ class _ChunkWriter:
         self._bytes = raw.stat().st_size
         self._fmt = fmt
         self._until = until
+        self._opened_at = time.time()
+        self._last_partial = 0.0
+        self._last_flush = time.time()
         _mark_open(raw, True)
 
     def _write(self, annexb: bytes) -> None:
@@ -360,7 +371,11 @@ class _ChunkWriter:
         try:
             self._fh.write(annexb)
             self._bytes += len(annexb)
-            self._fh.flush()
+            # Flush occasionally — every-frame flush stalls live decode on the same disk.
+            now = time.time()
+            if now - getattr(self, "_last_flush", 0) >= 1.0 or self._bytes % (2 * 1024 * 1024) < len(annexb):
+                self._fh.flush()
+                self._last_flush = now
         except OSError:
             try:
                 self._fh.close()
@@ -368,6 +383,35 @@ class _ChunkWriter:
                 pass
             self._fh = None
             _mark_open(self._raw, False)
+
+    def _maybe_partial(self) -> None:
+        if self._mode != "hour" or self._raw is None or self._bytes < 50_000:
+            return
+        now_ts = time.time()
+        age = now_ts - self._opened_at
+        due_first = self._last_partial <= 0 and age >= self.PARTIAL_FIRST_SEC
+        due_next = self._last_partial > 0 and (now_ts - self._last_partial) >= self.PARTIAL_EVERY_SEC
+        if not (due_first or due_next):
+            return
+        self._last_partial = now_ts
+        try:
+            if self._fh is not None:
+                self._fh.flush()
+                os.fsync(self._fh.fileno())
+        except OSError:
+            pass
+        path = self._raw
+        fmt = self._fmt
+
+        def work() -> None:
+            try:
+                from v380.client.extras import remux_snapshot
+
+                remux_snapshot(path, fmt)
+            except Exception:
+                pass
+
+        threading.Thread(target=work, daemon=True, name="partial-remux").start()
 
     def close(self) -> Path | None:
         if self._fh is not None:
@@ -387,6 +431,11 @@ class _ChunkWriter:
         _mark_open(path, False)
         if path is None:
             return None
+        # Drop stale partial when the real hour remux finishes.
+        try:
+            path.with_name(path.stem + ".partial.mp4").unlink(missing_ok=True)
+        except OSError:
+            pass
         if wrote <= 0:
             path.unlink(missing_ok=True)
             return None
