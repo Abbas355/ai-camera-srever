@@ -362,15 +362,21 @@ class LiveView(tk.Frame):
         self.cam_box.bind("<<ComboboxSelected>>", self._pick_device)
         ttk.Button(form, text="Discover", command=self._discover).grid(row=1, column=1, padx=(0, 8))
 
-        lab(0, 2, "Source")
+        lab(0, 2, "Brand")
+        self.brand_e = ttk.Combobox(form, values=["V380", "EZVIZ"], width=8, state="readonly")
+        self.brand_e.set("V380")
+        self.brand_e.grid(row=1, column=2, padx=(0, 8), pady=(2, 6))
+        self.brand_e.bind("<<ComboboxSelected>>", lambda _e: self._on_brand_change())
+
+        lab(0, 3, "Source")
         self.source_e = ttk.Combobox(form, values=["LAN", "Cloud"], width=8, state="readonly")
         self.source_e.set("LAN")
-        self.source_e.grid(row=1, column=2, padx=(0, 8), pady=(2, 6))
+        self.source_e.grid(row=1, column=3, padx=(0, 8), pady=(2, 6))
 
-        lab(0, 3, "Quality")
+        lab(0, 4, "Quality")
         self.quality_e = ttk.Combobox(form, values=["HD", "SD"], width=6, state="readonly")
         self.quality_e.set("HD")
-        self.quality_e.grid(row=1, column=3, padx=(0, 8), pady=(2, 6))
+        self.quality_e.grid(row=1, column=4, padx=(0, 8), pady=(2, 6))
 
         lab(2, 0, "Camera IP")
         self.ip_e = ent(2, 0, 16, "")
@@ -380,7 +386,8 @@ class LiveView(tk.Frame):
         self.id_e = ent(2, 2, 12, "")
         lab(2, 3, "Username")
         self.user_e = ent(2, 3, 12, "")
-        lab(2, 4, "Password")
+        self._pass_lab = tk.Label(form, text="Password", fg=MUTED, bg=BG, font=FONT_SMALL)
+        self._pass_lab.grid(row=2, column=4, sticky="w")
         self.pass_e = ent(2, 4, 14, "", show="*")
         lab(2, 5, "Display name")
         self.name_e = ent(2, 5, 16, "")
@@ -389,7 +396,7 @@ class LiveView(tk.Frame):
         self.connect_btn.grid(row=3, column=6, padx=(8, 0), pady=(2, 6))
 
         self.status = status_bar(self)
-        self.status.configure(text="Discover a camera, enter password, Connect — saved only if login works")
+        self.status.configure(text="Pick brand (V380 or EZVIZ), enter credentials, Connect — saved only if login works")
         self.status.pack(fill="x")
 
         body = tk.Frame(self, bg=BG)
@@ -610,6 +617,7 @@ class LiveView(tk.Frame):
         ).pack(anchor="w", pady=(0, 12))
 
     def _apply_camera(self, cam: Camera) -> None:
+        self.brand_e.set(cam.brand_name)
         self.name_e.delete(0, "end")
         self.name_e.insert(0, cam.name)
         self.ip_e.delete(0, "end")
@@ -627,21 +635,57 @@ class LiveView(tk.Frame):
         self._pending_mac = cam.mac
         self._quality_name = cam.quality_name
         self._reset_ptz_origin()
+        self._on_brand_change()
+
+    def _brand(self) -> str:
+        return "ezviz" if self.brand_e.get() == "EZVIZ" else "v380"
+
+    def _on_brand_change(self) -> None:
+        ez = self._brand() == "ezviz"
+        self._pass_lab.configure(text="Verify code" if ez else "Password")
+        if ez:
+            if self.port_e.get().strip() in ("", "8800"):
+                self.port_e.delete(0, "end")
+                self.port_e.insert(0, "554")
+            if not self.user_e.get().strip():
+                self.user_e.insert(0, "admin")
+            self.source_e.set("LAN")
+            self._set_status("EZVIZ: enable RTSP in app · password = 6-letter verification code · PTZ not supported yet")
+        else:
+            if self.port_e.get().strip() == "554":
+                self.port_e.delete(0, "end")
+                self.port_e.insert(0, "8800")
 
     def _read_form(self) -> dict | None:
+        brand = self._brand()
         ip = self.ip_e.get().strip()
-        user = self.user_e.get().strip()
+        user = self.user_e.get().strip() or ("admin" if brand == "ezviz" else "")
         password = self.pass_e.get()
         quality_name = self.quality_e.get() or "HD"
-        source = "cloud" if self.source_e.get() == "Cloud" else "lan"
+        source = "lan" if brand == "ezviz" else ("cloud" if self.source_e.get() == "Cloud" else "lan")
         try:
             port = int(self.port_e.get().strip())
-            device_id = int(self.id_e.get().strip())
         except ValueError:
-            messagebox.showerror("Invalid input", "Port and Device ID must be numbers.")
+            messagebox.showerror("Invalid input", "Port must be a number.")
             return None
+        device_id = self.id_e.get().strip()
+        if brand == "v380":
+            try:
+                int(device_id)
+            except ValueError:
+                messagebox.showerror("Invalid input", "Device ID must be a number for V380.")
+                return None
+        elif not device_id:
+            from v380.client.ezviz_rtsp import synthetic_device_id
+
+            device_id = synthetic_device_id(ip)
+            self.id_e.delete(0, "end")
+            self.id_e.insert(0, device_id)
         if not user or not password:
-            messagebox.showerror("Missing fields", "Username and password are required.")
+            messagebox.showerror(
+                "Missing fields",
+                "Username and verification code are required." if brand == "ezviz" else "Username and password are required.",
+            )
             return None
         if source == "lan" and not ip:
             messagebox.showerror("Missing fields", "Camera IP is required for LAN.")
@@ -658,6 +702,8 @@ class LiveView(tk.Frame):
             "quality": 1 if quality_name == "HD" else 0,
             "quality_name": quality_name,
             "mac": self._pending_mac,
+            "brand": brand,
+            "rtsp_url": "",
         }
 
     def _set_status(self, text: str) -> None:
@@ -749,6 +795,8 @@ class LiveView(tk.Frame):
         self._cmd("ptz_stop", resync=True)
 
     def _ptz_ready(self) -> bool:
+        if self._brand() == "ezviz":
+            return False
         if self._api is not None and self._cam_id:
             return True
         client = self._client
@@ -823,6 +871,9 @@ class LiveView(tk.Frame):
         return ok
 
     def _calibrate_ptz(self) -> None:
+        if self._brand() == "ezviz":
+            self._set_status("PTZ is not supported on EZVIZ yet")
+            return
         if not self._ptz_ready():
             self._set_status("Connect first, then Calibrate")
             return
@@ -880,6 +931,10 @@ class LiveView(tk.Frame):
         threading.Thread(target=work, daemon=True, name="ptz-calibrate").start()
 
     def _cmd(self, name: str, resync: bool | None = None) -> None:
+        if self._brand() == "ezviz":
+            if name != "ptz_stop":
+                self._set_status("PTZ is not supported on EZVIZ yet")
+            return
         # Only resync after movement ends — resyncing on every tick causes lag/gray.
         if resync is None:
             resync = name == "ptz_stop"
@@ -901,6 +956,9 @@ class LiveView(tk.Frame):
         threading.Thread(target=work, daemon=True, name="ptz-cmd").start()
 
     def _alert_on(self) -> None:
+        if self._brand() == "ezviz":
+            self._set_status("Alert is not supported on EZVIZ yet")
+            return
         if self._api is not None and self._cam_id:
             cam_id = self._cam_id
             self._set_status("Alert ON")
@@ -1023,6 +1081,9 @@ class LiveView(tk.Frame):
             self._set_status("Listen off")
 
     def _toggle_talk(self) -> None:
+        if self._brand() == "ezviz":
+            self._set_status("Talk is not supported on EZVIZ yet")
+            return
         if self._talker.enabled:
             self._talker.enabled = False
             self._bg(self._talker.stop)
@@ -1143,6 +1204,7 @@ class LiveView(tk.Frame):
         fields = self._read_form()
         if fields is None:
             return
+        brand = fields.get("brand") or "v380"
         ip = fields["ip"]
         user = fields["username"]
         password = fields["password"]
@@ -1150,17 +1212,22 @@ class LiveView(tk.Frame):
         source = fields["source"]
         quality = fields["quality"]
         port = fields["port"]
-        device_id = int(fields["device_id"])
+        device_raw = str(fields["device_id"])
 
         self._stop.clear()
         self._quality_name = quality_name
         self.connect_btn.configure(text="Disconnect", bg=RED)
-        self._set_status(f"Connecting ({source.upper()} {quality_name}) …")
+        label = "EZVIZ" if brand == "ezviz" else f"{source.upper()} {quality_name}"
+        self._set_status(f"Connecting ({label}) …")
 
         def worker() -> None:
             if self._api is not None:
                 self._connect_remote(fields)
                 return
+            if brand == "ezviz":
+                self._connect_local_ezviz(fields)
+                return
+            device_id = int(device_raw)
             while not self._stop.is_set():
                 client = None
                 decoder = None
@@ -1244,6 +1311,41 @@ class LiveView(tk.Frame):
 
         self._thread = threading.Thread(target=worker, daemon=True)
         self._thread.start()
+
+    def _connect_local_ezviz(self, fields: dict) -> None:
+        from v380.client.ezviz_rtsp import EzvizRtspClient, build_rtsp_url
+
+        url = build_rtsp_url(
+            fields["ip"],
+            fields["password"],
+            username=fields["username"],
+            port=int(fields["port"]),
+        )
+        while not self._stop.is_set():
+            client = None
+            try:
+                client = EzvizRtspClient(url)
+                client.connect()
+                self._client = client
+                if not self._saved_once and self._on_connected is not None:
+                    self._saved_once = True
+                    self._ui(lambda f=fields: self._on_connected(f))
+                self._ui(lambda: self._set_codec("JPEG / RTSP"))
+                for kind, _is_iframe, payload in client.iter_video_frames(self._stop):
+                    if kind != "video" or not payload:
+                        continue
+                    self._push_jpeg(payload)
+                break
+            except Exception as exc:
+                if self._stop.is_set():
+                    break
+                self._ui(lambda m=str(exc): self._set_status(f"Reconnecting… ({m})"))
+                time.sleep(1.5)
+            finally:
+                if client is not None:
+                    client.close()
+                if self._client is client:
+                    self._client = None
 
     def _connect_remote(self, fields: dict) -> None:
         try:
@@ -1367,7 +1469,8 @@ class LiveView(tk.Frame):
 
     def _pump_stream(self, cam_id: int) -> None:
         while not self._stop.is_set():
-            if self._pump_h264(cam_id):
+            # EZVIZ Hub sessions are JPEG/MJPEG only — skip H.264 pump.
+            if self._brand() != "ezviz" and self._pump_h264(cam_id):
                 if self._stop.is_set():
                     break
                 time.sleep(0.05)

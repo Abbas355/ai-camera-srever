@@ -9,6 +9,7 @@ from collections.abc import Callable
 
 from v380.store.camera_store import Camera, CameraStore
 from v380.client.extras import get_relay_ip
+from v380.client.ezviz_rtsp import EzvizRtspClient, resolve_rtsp_url
 from v380.client.v380_client import LiveH264Decoder, V380SnapshotClient
 
 OnState = Callable[[int, str], None]
@@ -71,6 +72,9 @@ class PreviewManager:
         if stop.is_set():
             return
         self._on_state(cam.id, "Connecting…")
+        if getattr(cam, "is_ezviz", False) or str(getattr(cam, "brand", "") or "").lower() == "ezviz":
+            self._run_ezviz(cam, stop)
+            return
         quality = cam.quality if opts["stream_quality"] is None else opts["stream_quality"]
         while not stop.is_set():
             client = None
@@ -136,6 +140,32 @@ class PreviewManager:
             finally:
                 if decoder is not None:
                     decoder.close()
+                if client is not None:
+                    client.close()
+        self._on_state(cam.id, "Stopped")
+
+    def _run_ezviz(self, cam: Camera, stop: threading.Event) -> None:
+        while not stop.is_set():
+            client = None
+            try:
+                url = resolve_rtsp_url(cam)
+                if not url:
+                    raise RuntimeError("Missing EZVIZ RTSP URL")
+                client = EzvizRtspClient(url)
+                client.connect()
+                self._on_state(cam.id, "Live")
+                self._store.set_status(cam.id, error="", seen=True, codec="jpeg")
+                for kind, _is_iframe, payload in client.iter_video_frames(stop):
+                    if kind != "video" or not payload:
+                        continue
+                    self._publish(cam.id, payload)
+            except Exception as exc:
+                if stop.is_set():
+                    break
+                self._on_state(cam.id, "Offline")
+                self._store.set_status(cam.id, error=str(exc))
+                time.sleep(2.5)
+            finally:
                 if client is not None:
                     client.close()
         self._on_state(cam.id, "Stopped")

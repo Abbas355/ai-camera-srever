@@ -47,6 +47,7 @@ def call(obj, *names, args=(), kwargs=None, default=None):
 
 def load_mods() -> dict:
     from v380.client import extras as ex
+    from v380.client import ezviz_rtsp as ez
     from v380.client import v380_client as vc
     from v380.record import auto_record as ar
     from v380.store.camera_store import Camera, CameraStore
@@ -61,6 +62,10 @@ def load_mods() -> dict:
         "Decoder": pick(vc, "make_live_decoder", "LiveH264Decoder", "LiveH264Decoder"),
         "read_status": pick(ar, "read_worker_status", "read_worker_status"),
         "ensure_worker": pick(ar, "ensure_worker", "ensure_worker"),
+        "ezviz_client": ez.EzvizRtspClient,
+        "ezviz_probe": ez.probe_rtsp,
+        "ezviz_resolve": ez.resolve_rtsp_url,
+        "ezviz_brand": ez.normalize_brand,
     }
 
 
@@ -87,6 +92,9 @@ def cam_json(cam) -> dict:
         "quality": int(cam.quality),
         "auto_record": bool(cam_get(cam, "auto_record", "auto_record", default=False)),
         "record_chunk": str(cam_get(cam, "record_chunk", "record_chunk", default="hour") or "hour"),
+        "brand": str(cam_get(cam, "brand", default="v380") or "v380"),
+        "rtsp_url": str(cam_get(cam, "rtsp_url", default="") or ""),
+        "brand_name": str(cam_get(cam, "brand_name", default="V380") or "V380"),
         "created_at": cam.created_at,
         "updated_at": cam.updated_at,
         "quality_name": str(cam_get(cam, "quality_name", "quality_name", default="HD")),
@@ -95,8 +103,27 @@ def cam_json(cam) -> dict:
 
 
 def ping_camera(cam) -> dict:
-    """TCP + login probe so the UI can tell if a camera is online."""
+    """Probe V380 TCP login or EZVIZ RTSP."""
     t0 = time.time()
+    brand_fn = MODS.get("ezviz_brand")
+    brand = brand_fn(cam_get(cam, "brand", default="v380")) if callable(brand_fn) else "v380"
+    if brand == "ezviz":
+        resolve = MODS.get("ezviz_resolve")
+        probe = MODS.get("ezviz_probe")
+        url = resolve(cam) if callable(resolve) else ""
+        if not url:
+            return {
+                "ok": False,
+                "reachable": False,
+                "online": False,
+                "error": "Missing EZVIZ RTSP URL / IP",
+                "ms": int((time.time() - t0) * 1000),
+            }
+        out = probe(url) if callable(probe) else {"ok": False, "error": "EZVIZ probe missing"}
+        out.setdefault("ms", int((time.time() - t0) * 1000))
+        out["brand"] = "ezviz"
+        return out
+
     Client = MODS["Client"]
     relay = MODS["relay"]
     device_id = int(cam_get(cam, "device_id", "device_id") or 0)
@@ -161,6 +188,7 @@ def ping_camera(cam) -> dict:
             "online": True,
             "host": host,
             "port": port,
+            "brand": "v380",
             "ms": int((time.time() - t0) * 1000),
         }
     except Exception as exc:
@@ -171,6 +199,7 @@ def ping_camera(cam) -> dict:
             "host": host,
             "port": port,
             "error": str(exc),
+            "brand": "v380",
             "ms": int((time.time() - t0) * 1000),
         }
     finally:
@@ -340,23 +369,41 @@ def clip_index() -> dict:
 
 def camera_from_body(body: dict, existing=None):
     Camera = MODS["Camera"]
+    brand_fn = MODS.get("ezviz_brand")
+    raw_brand = body.get("brand") or (cam_get(existing, "brand", default="v380") if existing else "v380")
+    brand = brand_fn(raw_brand) if callable(brand_fn) else (
+        "ezviz" if str(raw_brand or "").lower() == "ezviz" else "v380"
+    )
     device_id = str(
         body.get("device_id")
-        or body.get("device_id")
         or (cam_get(existing, "device_id", "device_id") if existing else "")
         or ""
     )
     password = body.get("password")
     if not password and existing is not None:
         password = existing.password
+    rtsp_url = str(body.get("rtsp_url") or (cam_get(existing, "rtsp_url", default="") if existing else "") or "")
+    ip = str(body.get("ip") or (existing.ip if existing else "") or "")
+    username = str(body.get("username") or (existing.username if existing else "") or ("admin" if brand == "ezviz" else ""))
+    port_default = 554 if brand == "ezviz" else 8800
+    port = int(body.get("port") or (existing.port if existing else port_default) or port_default)
+    if brand == "ezviz":
+        if not device_id:
+            from v380.client.ezviz_rtsp import synthetic_device_id
+
+            device_id = synthetic_device_id(ip, rtsp_url)
+        if not rtsp_url and ip:
+            from v380.client.ezviz_rtsp import build_rtsp_url
+
+            rtsp_url = build_rtsp_url(ip, str(password or ""), username=username, port=port)
     return Camera(
         id=int(body.get("id") or (existing.id if existing else 0)),
         name=str(body.get("name") or device_id),
         device_id=device_id,
         mac=str(body.get("mac") or (existing.mac if existing else "") or ""),
-        ip=str(body.get("ip") or (existing.ip if existing else "") or ""),
-        port=int(body.get("port") or (existing.port if existing else 8800)),
-        username=str(body.get("username") or (existing.username if existing else "")),
+        ip=ip,
+        port=port,
+        username=username,
         password=str(password or ""),
         source=str(body.get("source") or (existing.source if existing else "lan")),
         quality=int(
@@ -371,12 +418,13 @@ def camera_from_body(body: dict, existing=None):
         ),
         record_chunk=str(
             body.get("record_chunk")
-            or body.get("record_chunk")
             or (cam_get(existing, "record_chunk", "record_chunk", default="hour") if existing else "hour")
             or "hour"
         ),
         created_at=existing.created_at if existing else "",
         updated_at=existing.updated_at if existing else "",
+        brand=brand,
+        rtsp_url=rtsp_url,
     )
 
 
@@ -411,6 +459,11 @@ class Session:
         Decoder = MODS["Decoder"]
         relay = MODS["relay"]
         cam = self.cam
+        brand_fn = MODS.get("ezviz_brand")
+        brand = brand_fn(cam_get(cam, "brand", default="v380")) if callable(brand_fn) else "v380"
+        if brand == "ezviz":
+            self._run_ezviz()
+            return
         device_id = int(cam_get(cam, "device_id", "device_id") or 0)
         while self.alive and not self._stop.is_set():
             client = None
@@ -513,6 +566,49 @@ class Session:
                     self._client = None
         self.state = "Stopped"
 
+    def _run_ezviz(self) -> None:
+        """EZVIZ path: RTSP → JPEG for snapshot + MJPEG live."""
+        EzClient = MODS.get("ezviz_client")
+        resolve = MODS.get("ezviz_resolve")
+        cam = self.cam
+        while self.alive and not self._stop.is_set():
+            client = None
+            try:
+                url = resolve(cam) if callable(resolve) else ""
+                if not url:
+                    raise RuntimeError("Missing EZVIZ RTSP URL")
+                self.state = "Connecting EZVIZ…"
+                client = EzClient(url) if callable(EzClient) else None
+                if client is None:
+                    raise RuntimeError("EZVIZ client missing")
+                call(client, "connect", "connect")
+                self._client = client
+                self.state = "Live (EZVIZ)"
+                self.codec = "jpeg"
+                for item in client.iter_video_frames(self._stop):
+                    if not self.alive:
+                        break
+                    if not (isinstance(item, tuple) and len(item) == 3):
+                        continue
+                    kind, _is_iframe, payload = item
+                    if kind != "video" or not payload:
+                        continue
+                    self.jpeg = payload
+                    self._jpeg_n += 1
+            except Exception as exc:
+                if self._stop.is_set():
+                    break
+                self.state = f"Offline ({exc})"
+                print("[studio] ezviz", getattr(cam, "name", "?"), ":", exc)
+                self._client = None
+                time.sleep(2.5)
+            finally:
+                if client is not None:
+                    call(client, "close", "close")
+                if self._client is client:
+                    self._client = None
+        self.state = "Stopped"
+
     def subscribe(self) -> queue.Queue:
         q: queue.Queue = queue.Queue(maxsize=2)
         with self._sub_lock:
@@ -548,7 +644,14 @@ class Session:
             except queue.Full:
                 pass
 
+    def _is_ezviz(self) -> bool:
+        brand_fn = MODS.get("ezviz_brand")
+        brand = brand_fn(cam_get(self.cam, "brand", default="v380")) if callable(brand_fn) else "v380"
+        return brand == "ezviz"
+
     def command(self, name: str, hold: float = 0.0) -> bool:
+        if self._is_ezviz():
+            return False
         # Wait briefly — live session may still be connecting.
         for _ in range(50):
             if self._client is not None:
@@ -597,6 +700,8 @@ class Session:
         return bool(call(self._client, "send_control", "send_control", args=(name,), default=False))
 
     def talk_start(self) -> bool:
+        if self._is_ezviz():
+            return False
         for _ in range(6):
             if self._client is not None:
                 break
@@ -606,15 +711,19 @@ class Session:
         return bool(call(self._client, "start_talk", "start_talk", default=False))
 
     def talk_audio(self, ima: bytes) -> bool:
-        if self._client is None:
+        if self._is_ezviz() or self._client is None:
             return False
         return bool(call(self._client, "send_talk_audio", "send_talk_audio", args=(ima,), default=False))
 
     def talk_stop(self) -> None:
+        if self._is_ezviz():
+            return
         if self._client is not None:
             call(self._client, "stop_talk", "stop_talk")
 
     def alert_on(self) -> bool:
+        if self._is_ezviz():
+            return False
         Alert = MODS["Alert"]
         if self._client is None or Alert is None:
             return False
@@ -833,6 +942,10 @@ class Handler(BaseHTTPRequestHandler):
                 ses = HUB.session(cam_id)
                 if ses is None:
                     self.send_json({"ok": False, "error": "missing camera"}, 404)
+                    return
+                # EZVIZ Hub sessions are JPEG/MJPEG only — fail fast so clients fall back.
+                if (ses.codec or "") == "jpeg" or ses._is_ezviz():
+                    self.send_json({"ok": False, "error": "mjpeg only"}, 404)
                     return
                 deadline = time.time() + 3
                 while ses.alive and ses.last_iframe is None and time.time() < deadline:

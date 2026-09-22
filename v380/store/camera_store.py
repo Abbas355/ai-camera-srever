@@ -24,6 +24,10 @@ def _chunk_mode(value: str | None) -> str:
     return "minute" if value == "minute" else "hour"
 
 
+def _brand(value: str | None) -> str:
+    return "ezviz" if str(value or "").strip().lower() == "ezviz" else "v380"
+
+
 @dataclass
 class Camera:
     id: int
@@ -40,6 +44,8 @@ class Camera:
     record_chunk: str
     created_at: str
     updated_at: str
+    brand: str = "v380"
+    rtsp_url: str = ""
 
     @property
     def quality_name(self) -> str:
@@ -52,6 +58,14 @@ class Camera:
     @property
     def chunk_label(self) -> str:
         return "1 min" if self.record_chunk == "minute" else "hourly"
+
+    @property
+    def brand_name(self) -> str:
+        return "EZVIZ" if str(self.brand or "").lower() == "ezviz" else "V380"
+
+    @property
+    def is_ezviz(self) -> bool:
+        return str(self.brand or "").lower() == "ezviz"
 
 
 class CameraStore:
@@ -91,13 +105,15 @@ class CameraStore:
                     """
                     UPDATE cameras SET
                         name=?, mac=?, ip=?, port=?, username=?, password_enc=?,
-                        source=?, quality=?, auto_record=?, record_chunk=?, updated_at=?
+                        source=?, quality=?, auto_record=?, record_chunk=?, brand=?, rtsp_url=?, updated_at=?
                     WHERE device_id=?
                     """,
                     (
                         cam.name, cam.mac, cam.ip, cam.port, cam.username, blob,
                         cam.source, cam.quality, 1 if cam.auto_record else 0,
-                        _chunk_mode(cam.record_chunk), now, cam.device_id,
+                        _chunk_mode(cam.record_chunk),
+                        _brand(cam.brand), cam.rtsp_url or "",
+                        now, cam.device_id,
                     ),
                 )
                 camera_id = int(existing["id"])
@@ -105,13 +121,16 @@ class CameraStore:
                 cur = self._conn.execute(
                     """
                     INSERT INTO cameras
-                        (name, device_id, mac, ip, port, username, password_enc, source, quality, auto_record, record_chunk, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        (name, device_id, mac, ip, port, username, password_enc, source, quality,
+                         auto_record, record_chunk, brand, rtsp_url, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         cam.name, cam.device_id, cam.mac, cam.ip, cam.port, cam.username, blob,
                         cam.source, cam.quality, 1 if cam.auto_record else 0,
-                        _chunk_mode(cam.record_chunk), now, now,
+                        _chunk_mode(cam.record_chunk),
+                        _brand(cam.brand), cam.rtsp_url or "",
+                        now, now,
                     ),
                 )
                 camera_id = int(cur.lastrowid)
@@ -129,13 +148,15 @@ class CameraStore:
                 """
                     UPDATE cameras SET
                         name=?, device_id=?, mac=?, ip=?, port=?, username=?, password_enc=?,
-                        source=?, quality=?, auto_record=?, record_chunk=?, updated_at=?
+                        source=?, quality=?, auto_record=?, record_chunk=?, brand=?, rtsp_url=?, updated_at=?
                     WHERE id=?
                     """,
                     (
                         cam.name, cam.device_id, cam.mac, cam.ip, cam.port, cam.username, blob,
                         cam.source, cam.quality, 1 if cam.auto_record else 0,
-                        _chunk_mode(cam.record_chunk), now, cam.id,
+                        _chunk_mode(cam.record_chunk),
+                        _brand(cam.brand), cam.rtsp_url or "",
+                        now, cam.id,
                     ),
             )
             self._conn.commit()
@@ -199,6 +220,7 @@ class CameraStore:
             self._conn.commit()
 
     def _row(self, row: sqlite3.Row) -> Camera:
+        keys = set(row.keys())
         return Camera(
             id=int(row["id"]),
             name=row["name"],
@@ -210,8 +232,10 @@ class CameraStore:
             password=decrypt(self._key, row["password_enc"]),
             source=row["source"],
             quality=int(row["quality"]),
-            auto_record=bool(row["auto_record"]) if "auto_record" in row.keys() else False,
-            record_chunk=_chunk_mode(row["record_chunk"] if "record_chunk" in row.keys() else "hour"),
+            auto_record=bool(row["auto_record"]) if "auto_record" in keys else False,
+            record_chunk=_chunk_mode(row["record_chunk"] if "record_chunk" in keys else "hour"),
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+            brand=_brand(row["brand"] if "brand" in keys else "v380"),
+            rtsp_url=str(row["rtsp_url"] if "rtsp_url" in keys else "") or "",
         )

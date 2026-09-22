@@ -59,6 +59,10 @@ def _friendly_probe_error(probe: dict) -> str:
         return "Invalid username"
     if "invalid device" in low:
         return "Invalid device ID"
+    if "rtsp" in low or str(probe.get("brand") or "").lower() == "ezviz":
+        if not probe.get("reachable"):
+            return f"EZVIZ offline — {err or 'unreachable on :554'}"
+        return f"EZVIZ RTSP failed — {err or 'enable LAN Live View / RTSP in EZVIZ app'}"
     if not probe.get("reachable"):
         return f"Camera offline — {err or 'unreachable'}"
     return f"Login failed — {err or 'unknown error'}"
@@ -95,7 +99,7 @@ class HomeFrame(tk.Frame):
         brand = tk.Frame(top, bg=CARD)
         brand.pack(side="left")
         tk.Label(brand, text="V380 Studio", fg=TEXT, bg=CARD, font=FONT_HEAD).pack(anchor="w")
-        tk.Label(brand, text="Live cameras", fg=MUTED, bg=CARD, font=FONT_SMALL).pack(anchor="w")
+        tk.Label(brand, text="V380 + EZVIZ cameras", fg=MUTED, bg=CARD, font=FONT_SMALL).pack(anchor="w")
 
         primary_button(top, "Add camera", self._on_add).pack(side="right")
         if self._on_clips is not None:
@@ -264,7 +268,18 @@ class HomeFrame(tk.Frame):
                 old.password,
                 old.source,
                 old.quality,
-            ) != (cam.ip, cam.port, cam.username, cam.password, cam.source, cam.quality):
+                getattr(old, "brand", "v380"),
+                getattr(old, "rtsp_url", ""),
+            ) != (
+                cam.ip,
+                cam.port,
+                cam.username,
+                cam.password,
+                cam.source,
+                cam.quality,
+                getattr(cam, "brand", "v380"),
+                getattr(cam, "rtsp_url", ""),
+            ):
                 restart_preview = True
             tile.apply_cam(cam)
         if rec_changed:
@@ -405,7 +420,7 @@ class _Tile(tk.Frame):
 
         self._meta = tk.Label(
             foot,
-            text=f"{cam.device_id}  ·  {cam.ip or 'cloud'}  ·  {cam.quality_name}",
+            text=f"{cam.brand_name}  ·  {cam.device_id}  ·  {cam.ip or 'cloud'}  ·  {cam.quality_name}",
             fg=MUTED,
             bg=CARD,
             font=FONT_SMALL,
@@ -492,7 +507,7 @@ class _Tile(tk.Frame):
     def apply_cam(self, cam: Camera) -> None:
         self.cam = cam
         self._name.configure(text=cam.name)
-        self._meta.configure(text=f"{cam.device_id}  ·  {cam.ip or 'cloud'}  ·  {cam.quality_name}")
+        self._meta.configure(text=f"{cam.brand_name}  ·  {cam.device_id}  ·  {cam.ip or 'cloud'}  ·  {cam.quality_name}")
 
     def set_state(self, text: str) -> None:
         low = text.lower()
@@ -558,20 +573,28 @@ class EditDialog(tk.Toplevel):
             e.grid(row=r, column=1, pady=5, padx=(12, 0), ipady=5)
             return e
 
-        self.name_e = row(1, "Name", cam.name)
-        self.ip_e = row(2, "IP", cam.ip)
-        self.port_e = row(3, "Port", str(cam.port))
-        self.id_e = row(4, "Device ID", cam.device_id)
-        self.user_e = row(5, "Username", cam.username)
-        self.pass_e = row(6, "Password", cam.password, "*")
-        tk.Label(wrap, text="Source", fg=MUTED, bg=CARD, font=FONT_SMALL).grid(row=7, column=0, sticky="w", pady=5)
+        tk.Label(wrap, text="Brand", fg=MUTED, bg=CARD, font=FONT_SMALL).grid(row=1, column=0, sticky="w", pady=5)
+        self.brand_e = ttk.Combobox(wrap, values=["V380", "EZVIZ"], width=28, state="readonly")
+        self.brand_e.set(cam.brand_name)
+        self.brand_e.grid(row=1, column=1, pady=5, padx=(12, 0))
+        self.brand_e.bind("<<ComboboxSelected>>", lambda _e: self._on_brand())
+
+        self.name_e = row(2, "Name", cam.name)
+        self.ip_e = row(3, "IP", cam.ip)
+        self.port_e = row(4, "Port", str(cam.port))
+        self.id_e = row(5, "Device ID", cam.device_id)
+        self.user_e = row(6, "Username", cam.username or ("admin" if cam.is_ezviz else ""))
+        self.pass_e = row(7, "Password", cam.password, "*")
+        self._pass_label = wrap.grid_slaves(row=7, column=0)[0]
+        self.rtsp_e = row(8, "RTSP URL", getattr(cam, "rtsp_url", "") or "")
+        tk.Label(wrap, text="Source", fg=MUTED, bg=CARD, font=FONT_SMALL).grid(row=9, column=0, sticky="w", pady=5)
         self.source_e = ttk.Combobox(wrap, values=["LAN", "Cloud"], width=28, state="readonly")
         self.source_e.set(cam.source_name)
-        self.source_e.grid(row=7, column=1, pady=5, padx=(12, 0))
-        tk.Label(wrap, text="Quality", fg=MUTED, bg=CARD, font=FONT_SMALL).grid(row=8, column=0, sticky="w", pady=5)
+        self.source_e.grid(row=9, column=1, pady=5, padx=(12, 0))
+        tk.Label(wrap, text="Quality", fg=MUTED, bg=CARD, font=FONT_SMALL).grid(row=10, column=0, sticky="w", pady=5)
         self.quality_e = ttk.Combobox(wrap, values=["HD", "SD"], width=28, state="readonly")
         self.quality_e.set(cam.quality_name)
-        self.quality_e.grid(row=8, column=1, pady=5, padx=(12, 0))
+        self.quality_e.grid(row=10, column=1, pady=5, padx=(12, 0))
         self.rec_var = tk.IntVar(value=1 if cam.auto_record else 0)
         tk.Checkbutton(
             wrap,
@@ -583,29 +606,63 @@ class EditDialog(tk.Toplevel):
             activebackground=CARD,
             activeforeground=TEXT,
             font=FONT_SMALL,
-        ).grid(row=9, column=0, columnspan=2, sticky="w", pady=(10, 0))
-        tk.Label(wrap, text="Chunk size", fg=MUTED, bg=CARD, font=FONT_SMALL).grid(row=10, column=0, sticky="w", pady=5)
+        ).grid(row=11, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        tk.Label(wrap, text="Chunk size", fg=MUTED, bg=CARD, font=FONT_SMALL).grid(row=12, column=0, sticky="w", pady=5)
         self.chunk_e = ttk.Combobox(wrap, values=["Every hour", "Every minute"], width=28, state="readonly")
         self.chunk_e.set("Every minute" if cam.record_chunk == "minute" else "Every hour")
-        self.chunk_e.grid(row=10, column=1, pady=5, padx=(12, 0))
+        self.chunk_e.grid(row=12, column=1, pady=5, padx=(12, 0))
 
         self._hint = tk.Label(wrap, text="", fg=MUTED, bg=CARD, font=FONT_SMALL)
-        self._hint.grid(row=11, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        self._hint.grid(row=13, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
         actions = tk.Frame(wrap, bg=CARD)
-        actions.grid(row=12, column=0, columnspan=2, sticky="e", pady=(14, 0))
+        actions.grid(row=14, column=0, columnspan=2, sticky="e", pady=(14, 0))
         ghost_button(actions, "Cancel", self.destroy).pack(side="right", padx=(8, 0))
         self._save_btn = primary_button(actions, "Save", self._save)
         self._save_btn.pack(side="right")
+        self._on_brand()
+
+    def _brand(self) -> str:
+        return "ezviz" if self.brand_e.get() == "EZVIZ" else "v380"
+
+    def _on_brand(self) -> None:
+        ez = self._brand() == "ezviz"
+        self._pass_label.configure(text="Verify code" if ez else "Password")
+        if ez:
+            if not self.port_e.get().strip() or self.port_e.get().strip() == "8800":
+                self.port_e.delete(0, "end")
+                self.port_e.insert(0, "554")
+            if not self.user_e.get().strip():
+                self.user_e.insert(0, "admin")
+            self.source_e.set("LAN")
+            self._hint.configure(
+                text="EZVIZ: enable LAN Live View / RTSP in the EZVIZ app. Password = 6-letter verification code.",
+                fg=MUTED,
+            )
+        else:
+            if self.port_e.get().strip() == "554":
+                self.port_e.delete(0, "end")
+                self.port_e.insert(0, "8800")
+            self._hint.configure(text="", fg=MUTED)
 
     def _save(self) -> None:
+        brand = self._brand()
         try:
             port = int(self.port_e.get().strip())
-            device_id = self.id_e.get().strip()
-            int(device_id)
         except ValueError:
-            messagebox.showerror("Invalid input", "Port and Device ID must be numbers.")
+            messagebox.showerror("Invalid input", "Port must be a number.")
             return
+        device_id = self.id_e.get().strip()
+        if brand == "v380":
+            try:
+                int(device_id)
+            except ValueError:
+                messagebox.showerror("Invalid input", "Device ID must be a number for V380.")
+                return
+        elif not device_id:
+            from v380.client.ezviz_rtsp import synthetic_device_id
+
+            device_id = synthetic_device_id(self.ip_e.get().strip(), self.rtsp_e.get().strip())
         cam = Camera(
             id=self._cam.id,
             name=self.name_e.get().strip() or device_id,
@@ -613,17 +670,25 @@ class EditDialog(tk.Toplevel):
             mac=self._cam.mac,
             ip=self.ip_e.get().strip(),
             port=port,
-            username=self.user_e.get().strip(),
+            username=self.user_e.get().strip() or ("admin" if brand == "ezviz" else ""),
             password=self.pass_e.get(),
-            source="cloud" if self.source_e.get() == "Cloud" else "lan",
+            source="cloud" if self.source_e.get() == "Cloud" and brand != "ezviz" else "lan",
             quality=1 if self.quality_e.get() == "HD" else 0,
             auto_record=bool(self.rec_var.get()),
             record_chunk="minute" if self.chunk_e.get() == "Every minute" else "hour",
             created_at=self._cam.created_at,
             updated_at=self._cam.updated_at,
+            brand=brand,
+            rtsp_url=self.rtsp_e.get().strip(),
         )
         if not cam.username or not cam.password:
-            messagebox.showerror("Missing fields", "Username and password are required.")
+            messagebox.showerror(
+                "Missing fields",
+                "Username and verification code are required." if brand == "ezviz" else "Username and password are required.",
+            )
+            return
+        if brand == "ezviz" and not cam.ip and not cam.rtsp_url:
+            messagebox.showerror("Missing fields", "IP or full RTSP URL is required for EZVIZ.")
             return
 
         if self._api is None:
@@ -632,7 +697,7 @@ class EditDialog(tk.Toplevel):
             return
 
         self._save_btn.configure(state="disabled", text="Checking…")
-        self._hint.configure(text="Verifying camera password…", fg=ORANGE)
+        self._hint.configure(text="Verifying camera…", fg=ORANGE)
 
         def work() -> None:
             try:
@@ -647,6 +712,8 @@ class EditDialog(tk.Toplevel):
                         "password": cam.password,
                         "source": cam.source,
                         "quality": cam.quality,
+                        "brand": cam.brand,
+                        "rtsp_url": cam.rtsp_url,
                     }
                 )
                 if not probe.get("online"):

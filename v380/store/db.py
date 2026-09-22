@@ -22,6 +22,8 @@ CREATE TABLE IF NOT EXISTS cameras (
     quality INTEGER NOT NULL DEFAULT 1 CHECK (quality IN (0, 1)),
     auto_record INTEGER NOT NULL DEFAULT 0 CHECK (auto_record IN (0, 1)),
     record_chunk TEXT NOT NULL DEFAULT 'hour' CHECK (record_chunk IN ('hour', 'minute')),
+    brand TEXT NOT NULL DEFAULT 'v380',
+    rtsp_url TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -54,6 +56,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE cameras ADD COLUMN auto_record INTEGER NOT NULL DEFAULT 0")
     if "record_chunk" not in cols:
         conn.execute("ALTER TABLE cameras ADD COLUMN record_chunk TEXT NOT NULL DEFAULT 'hour'")
+    if "brand" not in cols:
+        conn.execute("ALTER TABLE cameras ADD COLUMN brand TEXT NOT NULL DEFAULT 'v380'")
+    if "rtsp_url" not in cols:
+        conn.execute("ALTER TABLE cameras ADD COLUMN rtsp_url TEXT NOT NULL DEFAULT ''")
     conn.commit()
 
 

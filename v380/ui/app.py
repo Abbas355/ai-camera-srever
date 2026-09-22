@@ -126,6 +126,8 @@ class StudioApp(tk.Tk):
             record_chunk=existing.record_chunk if existing else "hour",
             created_at="",
             updated_at="",
+            brand=str(fields.get("brand") or (existing.brand if existing else "v380") or "v380"),
+            rtsp_url=str(fields.get("rtsp_url") or (existing.rtsp_url if existing else "") or ""),
         )
         saved = self.store.upsert(cam)
         self.recorders.sync(self.store.list())

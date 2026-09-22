@@ -162,22 +162,25 @@ def restart_local_server(timeout: float = 18.0) -> str:
 
 def camera_from_dict(data: dict) -> Camera:
     names = {f.name for f in fields(Camera)}
-    device_id = str(data.get("device_id") or data.get("device_id") or "")
+    device_id = str(data.get("device_id") or "")
+    brand = "ezviz" if str(data.get("brand") or "").strip().lower() == "ezviz" else "v380"
     mapped = {
         "id": int(data.get("id") or 0),
         "name": str(data.get("name") or device_id),
         "device_id": device_id,
         "mac": str(data.get("mac") or ""),
         "ip": str(data.get("ip") or ""),
-        "port": int(data.get("port") or 8800),
-        "username": str(data.get("username") or ""),
+        "port": int(data.get("port") or (554 if brand == "ezviz" else 8800)),
+        "username": str(data.get("username") or ("admin" if brand == "ezviz" else "")),
         "password": str(data.get("password") or ""),
         "source": str(data.get("source") or "lan"),
         "quality": int(data.get("quality") if data.get("quality") is not None else 1),
-        "auto_record": bool(data.get("auto_record") if data.get("auto_record") is not None else data.get("auto_record") or False),
-        "record_chunk": str(data.get("record_chunk") or data.get("record_chunk") or "hour"),
+        "auto_record": bool(data.get("auto_record") if data.get("auto_record") is not None else False),
+        "record_chunk": str(data.get("record_chunk") or "hour"),
         "created_at": str(data.get("created_at") or ""),
         "updated_at": str(data.get("updated_at") or ""),
+        "brand": brand,
+        "rtsp_url": str(data.get("rtsp_url") or ""),
     }
     return Camera(**{k: v for k, v in mapped.items() if k in names})
 
@@ -277,7 +280,7 @@ class StudioAPI:
         body = {
             "id": cam.id,
             "name": cam.name,
-            "device_id": getattr(cam, "device_id", None) or getattr(cam, "device_id", ""),
+            "device_id": getattr(cam, "device_id", None) or "",
             "mac": cam.mac,
             "ip": cam.ip,
             "port": cam.port,
@@ -285,8 +288,10 @@ class StudioAPI:
             "password": cam.password,
             "source": cam.source,
             "quality": cam.quality,
-            "auto_record": bool(getattr(cam, "auto_record", None) or getattr(cam, "auto_record", False)),
-            "record_chunk": getattr(cam, "record_chunk", None) or getattr(cam, "record_chunk", "hour"),
+            "auto_record": bool(getattr(cam, "auto_record", False)),
+            "record_chunk": getattr(cam, "record_chunk", None) or "hour",
+            "brand": getattr(cam, "brand", None) or "v380",
+            "rtsp_url": getattr(cam, "rtsp_url", None) or "",
         }
         if cam.id:
             out = self.request("PUT", f"/api/cameras/{cam.id}", body)
@@ -312,16 +317,19 @@ class StudioAPI:
 
     def probe_camera(self, fields: dict) -> dict:
         """Check camera reachability + login without saving."""
+        brand = "ezviz" if str(fields.get("brand") or "").strip().lower() == "ezviz" else "v380"
         body = {
             "name": fields.get("name") or fields.get("device_id") or "",
             "device_id": fields.get("device_id") or "",
             "mac": fields.get("mac") or "",
             "ip": fields.get("ip") or "",
-            "port": int(fields.get("port") or 8800),
-            "username": fields.get("username") or "",
+            "port": int(fields.get("port") or (554 if brand == "ezviz" else 8800)),
+            "username": fields.get("username") or ("admin" if brand == "ezviz" else ""),
             "password": fields.get("password") or "",
             "source": fields.get("source") or "lan",
             "quality": int(fields.get("quality") if fields.get("quality") is not None else 1),
+            "brand": brand,
+            "rtsp_url": fields.get("rtsp_url") or "",
         }
         return self.request("POST", "/api/cameras/probe", body, timeout=20)
 

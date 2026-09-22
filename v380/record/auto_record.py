@@ -509,6 +509,9 @@ class AutoRecordManager:
             self._alive.clear()
 
     def _run(self, cam: Camera, flag: threading.Event) -> None:
+        if getattr(cam, "is_ezviz", False) or str(getattr(cam, "brand", "") or "").lower() == "ezviz":
+            self._run_ezviz(cam, flag)
+            return
         writer = _ChunkWriter(cam, self._rec_dir)
         self._alive[cam.id] = False
         try:
@@ -556,6 +559,92 @@ class AutoRecordManager:
                             pass
         finally:
             writer.close()
+            with self._lock:
+                if self._flags.get(cam.id) is flag:
+                    self._alive[cam.id] = False
+                    self._flags.pop(cam.id, None)
+                if self._threads.get(cam.id) is threading.current_thread():
+                    self._threads.pop(cam.id, None)
+
+    def _run_ezviz(self, cam: Camera, flag: threading.Event) -> None:
+        """EZVIZ: FFmpeg copy from RTSP into timed .mp4 chunks."""
+        from v380.client.ezviz_rtsp import resolve_rtsp_url
+        from v380.client.v380_client import _ffmpeg_exe
+
+        self._alive[cam.id] = False
+        exe = _ffmpeg_exe()
+        url = resolve_rtsp_url(cam)
+        if not exe or not url:
+            _log(_data_dir(), f"ezviz record {cam.device_id}: missing ffmpeg or RTSP URL")
+            with self._lock:
+                if self._flags.get(cam.id) is flag:
+                    self._alive[cam.id] = False
+                    self._flags.pop(cam.id, None)
+                if self._threads.get(cam.id) is threading.current_thread():
+                    self._threads.pop(cam.id, None)
+            return
+        mode = chunk_mode(getattr(cam, "record_chunk", "hour"))
+        try:
+            while not self._stop.is_set() and not flag.is_set():
+                now = _now()
+                day, hour, minute, until = _chunk_stamp(now, mode)
+                folder = camera_folder(cam, self._rec_dir)
+                if mode == "minute":
+                    dest = folder / day / hour / f"{minute}.mp4"
+                else:
+                    dest = folder / day / f"{hour}.mp4"
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                kwargs = {
+                    "stdin": subprocess.DEVNULL,
+                    "stdout": subprocess.DEVNULL,
+                    "stderr": subprocess.DEVNULL,
+                }
+                if sys.platform == "win32":
+                    kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                proc = None
+                try:
+                    proc = subprocess.Popen(
+                        [
+                            exe,
+                            "-hide_banner",
+                            "-loglevel",
+                            "error",
+                            "-rtsp_transport",
+                            "tcp",
+                            "-i",
+                            url,
+                            "-c",
+                            "copy",
+                            "-movflags",
+                            "+faststart",
+                            "-y",
+                            str(dest),
+                        ],
+                        **kwargs,
+                    )
+                    self._alive[cam.id] = True
+                    while not self._stop.is_set() and not flag.is_set() and _now() < until:
+                        if proc.poll() is not None:
+                            break
+                        time.sleep(1.0)
+                except Exception as exc:
+                    self._alive[cam.id] = False
+                    _log(_data_dir(), f"ezviz record {cam.device_id}: {type(exc).__name__}: {exc}")
+                    if self._stop.is_set() or flag.is_set():
+                        break
+                    time.sleep(2.0)
+                finally:
+                    if proc is not None and proc.poll() is None:
+                        try:
+                            proc.terminate()
+                            proc.wait(timeout=5)
+                        except Exception:
+                            try:
+                                proc.kill()
+                            except Exception:
+                                pass
+                    self._alive[cam.id] = False
+        finally:
             with self._lock:
                 if self._flags.get(cam.id) is flag:
                     self._alive[cam.id] = False
