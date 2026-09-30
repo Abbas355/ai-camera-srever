@@ -263,6 +263,8 @@ class LiveView(tk.Frame):
         self._talker = Talker()
         self._alert = AlertSiren()
         self._recorder = H264Recorder(REC_DIR)
+        self._ezviz_recorder = None
+        self._ezviz_ready = False
         self._last_jpeg: bytes | None = None
         self._last_rgb = None
         self._fps_count = 0
@@ -605,16 +607,520 @@ class LiveView(tk.Frame):
         hold.grid(row=1, column=0, columnspan=2, padx=3, pady=2)
         hold.bind("<ButtonPress-1>", lambda _e: self._alert_on())
         hold.bind("<ButtonRelease-1>", lambda _e: self._alert_off())
-
-        title("NOTE")
+        self._alert_wav_btn = btn(alert, "Play alert.wav on camera", ORANGE, self._toggle_alert_wav, 22)
+        self._alert_wav_btn.grid(row=2, column=0, columnspan=2, padx=3, pady=(6, 2), sticky="ew")
         tk.Label(
-            panel,
-            text="PTZ moves the PTZ lens only.\nScroll this panel for all controls.",
+            alert,
+            text="Plays audio/alert.wav from the CAMERA speaker.\n"
+            "EZVIZ: needs Open Platform keys for custom WAV,\n"
+            "otherwise uses camera siren (not PC).",
             fg=MUTED,
             bg=CARD,
             justify="left",
             font=FONT_SMALL,
-        ).pack(anchor="w", pady=(0, 12))
+        ).grid(row=3, column=0, columnspan=2, sticky="w", padx=4)
+
+        self._ezviz_panel = tk.Frame(panel, bg=CARD)
+        self._build_ezviz_panel(self._ezviz_panel, title, btn)
+
+        title("NOTE")
+        self._note_lab = tk.Label(
+            panel,
+            text="Hold arrows to pan/tilt.\nScroll for light, image, alert.",
+            fg=MUTED,
+            bg=CARD,
+            justify="left",
+            font=FONT_SMALL,
+        )
+        self._note_lab.pack(anchor="w", pady=(0, 12))
+        self._on_brand_change()
+
+    def _build_ezviz_panel(self, host: tk.Frame, title, btn) -> None:
+        """Toggle-style controls that show current ON/OFF state."""
+        self._ezviz_toggles: dict[str, tk.Button] = {}
+        self._ezviz_modes: dict[str, dict[str, tk.Button]] = {}
+        self._ezviz_states: dict = {}
+        self._ezviz_siren_local = False
+        self._ezviz_armed_local: bool | None = None
+
+        def ez_title(text: str) -> None:
+            tk.Label(host, text=text, fg=MUTED, bg=CARD, font=FONT_SMALL).pack(anchor="w", pady=(12, 6))
+
+        # Emergency stop — always first
+        stop = tk.Button(
+            host,
+            text="STOP ALL ALARMS / SILENCE",
+            bg=RED,
+            fg="white",
+            relief="flat",
+            cursor="hand2",
+            font=FONT_BODY,
+            command=lambda: self._ezviz_action("silence_all"),
+        )
+        stop.pack(fill="x", padx=3, pady=(4, 6))
+        self._ezviz_online_lab = tk.Label(
+            host,
+            text="States: not loaded — Connect + sign in, then Refresh",
+            fg=MUTED,
+            bg=CARD,
+            justify="left",
+            font=FONT_SMALL,
+        )
+        self._ezviz_online_lab.pack(anchor="w", padx=4, pady=(0, 4))
+        ref_row = tk.Frame(host, bg=CARD)
+        ref_row.pack(fill="x", pady=(0, 4))
+        btn(ref_row, "Refresh states", ACCENT, self._refresh_ezviz_states, 22).pack(fill="x", padx=3)
+
+        def toggle(key: str, label: str, on_color=GREEN) -> None:
+            b = tk.Button(
+                host,
+                text=f"{label}: —",
+                width=24,
+                bg="#243040",
+                fg="white",
+                relief="flat",
+                cursor="hand2",
+                font=FONT_BODY,
+                command=lambda k=key: self._ezviz_toggle(k),
+            )
+            b.pack(fill="x", padx=3, pady=2)
+            b._ez_label = label  # type: ignore[attr-defined]
+            b._ez_on_color = on_color  # type: ignore[attr-defined]
+            self._ezviz_toggles[key] = b
+
+        def mode_row(group: str, title_text: str, options: list[tuple[str, str]]) -> None:
+            ez_title(title_text)
+            fr = tk.Frame(host, bg=CARD)
+            fr.pack(fill="x", pady=(0, 2))
+            self._ezviz_modes[group] = {}
+            for i, (label, value) in enumerate(options):
+                b = tk.Button(
+                    fr,
+                    text=label,
+                    width=11,
+                    bg="#243040",
+                    fg="white",
+                    relief="flat",
+                    cursor="hand2",
+                    font=FONT_BODY,
+                    command=lambda g=group, v=value: self._ezviz_set_mode(g, v),
+                )
+                b.grid(row=0, column=i, padx=3, pady=2, sticky="ew")
+                self._ezviz_modes[group][value] = b
+
+        ez_title("Privacy / Sleep")
+        toggle("privacy", "Privacy", ORANGE)
+        toggle("sleep", "Sleep", ORANGE)
+
+        ez_title("Tracking")
+        toggle("track", "Smart track", GREEN)
+        toggle("cruise", "Cruise", GREEN)
+        toggle("feature_track", "Feature track", GREEN)
+
+        ez_title("Lights / IR / Flood")
+        toggle("led", "Status LED", GREEN)
+        toggle("ir", "IR night LEDs", GREEN)
+        btn(host, "IR AUTO (day/night)", ACCENT, lambda: self._ezviz_action("ir_auto"), 24).pack(
+            fill="x", padx=3, pady=2
+        )
+        toggle("flood", "Flood light", GREEN)
+        toggle("flicker", "Strobe (flood+flash)", RED)
+        tk.Label(
+            host,
+            text="IR OFF = force day mode (LEDs off).\n"
+            "IR ON = force night / B&W (LEDs on — look pink on a phone camera).\n"
+            "IR AUTO = camera decides from light sensor.",
+            fg=MUTED,
+            bg=CARD,
+            justify="left",
+            font=FONT_SMALL,
+        ).pack(anchor="w", padx=4, pady=(0, 4))
+
+        mode_row(
+            "night_vision",
+            "Night vision",
+            [("Colour", "1"), ("B&W", "0"), ("Smart", "2")],
+        )
+
+        ez_title("Audio")
+        toggle("mic", "Microphone", ACCENT)
+        toggle("logo", "OSD logo", "#243040")
+        toggle("alarm_tone", "Alarm tone", ORANGE)
+
+        ez_title("Volume (speaker / mic)")
+        vol_fr = tk.Frame(host, bg=CARD)
+        vol_fr.pack(fill="x", padx=2, pady=(0, 4))
+        self._ezviz_spk_lab = tk.Label(
+            vol_fr, text="Alarm / speaker: 80%", fg="white", bg=CARD, font=FONT_SMALL, anchor="w"
+        )
+        self._ezviz_spk_lab.pack(fill="x")
+        self._ezviz_spk_scale = tk.Scale(
+            vol_fr,
+            from_=0,
+            to=100,
+            orient="horizontal",
+            bg=CARD,
+            fg="white",
+            highlightthickness=0,
+            troughcolor="#243040",
+            activebackground=ACCENT,
+            length=220,
+            showvalue=0,
+            command=self._on_ezviz_spk_slide,
+        )
+        self._ezviz_spk_scale.set(80)
+        self._ezviz_spk_scale.pack(fill="x", pady=(0, 6))
+        self._ezviz_mic_lab = tk.Label(
+            vol_fr, text="Microphone: 50%", fg="white", bg=CARD, font=FONT_SMALL, anchor="w"
+        )
+        self._ezviz_mic_lab.pack(fill="x")
+        self._ezviz_mic_scale = tk.Scale(
+            vol_fr,
+            from_=0,
+            to=100,
+            orient="horizontal",
+            bg=CARD,
+            fg="white",
+            highlightthickness=0,
+            troughcolor="#243040",
+            activebackground=ACCENT,
+            length=220,
+            showvalue=0,
+            command=self._on_ezviz_mic_slide,
+        )
+        self._ezviz_mic_scale.set(50)
+        self._ezviz_mic_scale.pack(fill="x", pady=(0, 4))
+        self._ezviz_vol_job = None
+        self._ezviz_vol_busy = False
+        btn(vol_fr, "Apply volumes now", ACCENT, self._apply_ezviz_volumes, 22).pack(fill="x", padx=1, pady=2)
+        tk.Label(
+            vol_fr,
+            text="Sliders auto-save ~0.8s after you stop dragging.\n"
+            "Custom alarm WAV: use EZVIZ phone app → Settings → Sound.",
+            fg=MUTED,
+            bg=CARD,
+            justify="left",
+            font=FONT_SMALL,
+        ).pack(anchor="w", pady=(2, 4))
+
+        ez_title("Detection")
+        toggle("armed", "Armed (alerts)", RED)
+        toggle("human", "Human detect", GREEN)
+        toggle("dnd", "Do not disturb", ORANGE)
+        toggle("allday", "All-day record", GREEN)
+
+        mode_row(
+            "alarm_sound",
+            "Alarm sound level",
+            [("Soft", "0"), ("Loud", "1"), ("Mute", "2")],
+        )
+        mode_row(
+            "sens",
+            "Detection sensitivity",
+            [("Low", "1"), ("Mid", "3"), ("High", "6")],
+        )
+
+        ez_title("Siren (active defense)")
+        toggle("siren", "Siren", RED)
+
+        tk.Label(
+            host,
+            text="Green/red button = ON now. Grey = OFF.\n"
+            "Press STOP ALL ALARMS if the camera is beeping.\n"
+            "Refresh states after power-on (camera must be Online).",
+            fg=MUTED,
+            bg=CARD,
+            justify="left",
+            font=FONT_SMALL,
+        ).pack(anchor="w", pady=(8, 4))
+
+    def _paint_ezviz_toggle(self, key: str, on: bool | None) -> None:
+        btn = (getattr(self, "_ezviz_toggles", {}) or {}).get(key)
+        if btn is None:
+            return
+        label = getattr(btn, "_ez_label", key)
+        on_color = getattr(btn, "_ez_on_color", GREEN)
+        if on is None:
+            btn.configure(text=f"{label}: ?", bg="#243040")
+        elif on:
+            btn.configure(text=f"{label}: ON", bg=on_color)
+        else:
+            btn.configure(text=f"{label}: OFF", bg="#243040")
+
+    def _paint_ezviz_mode(self, group: str, current: str | None) -> None:
+        modes = (getattr(self, "_ezviz_modes", {}) or {}).get(group) or {}
+        for value, btn in modes.items():
+            active = current is not None and str(current) == str(value)
+            btn.configure(bg=ORANGE if active else "#243040")
+
+    def _apply_ezviz_states(self, states: dict) -> None:
+        self._ezviz_states = dict(states or {})
+        if "siren" in states:
+            self._ezviz_siren_local = bool(states.get("siren"))
+        online = states.get("online")
+        serial = states.get("serial") or ""
+        lab = getattr(self, "_ezviz_online_lab", None)
+        if lab is not None:
+            if online is True:
+                lab.configure(text=f"Cloud: ONLINE  {serial}", fg=GREEN)
+            elif online is False:
+                lab.configure(text=f"Cloud: OFFLINE  {serial} — plug in / wait", fg=ORANGE)
+            else:
+                lab.configure(text="States loaded", fg=MUTED)
+        for key in (
+            "privacy",
+            "sleep",
+            "track",
+            "cruise",
+            "feature_track",
+            "led",
+            "ir",
+            "flood",
+            "flicker",
+            "mic",
+            "logo",
+            "alarm_tone",
+            "human",
+            "allday",
+            "dnd",
+        ):
+            if key in states:
+                self._paint_ezviz_toggle(key, bool(states.get(key)))
+        armed = states.get("armed")
+        if armed is None:
+            armed = self._ezviz_armed_local
+        self._paint_ezviz_toggle("armed", armed if armed is not None else None)
+        self._paint_ezviz_toggle("siren", bool(self._ezviz_siren_local or states.get("siren")))
+        if "night_vision" in states:
+            self._paint_ezviz_mode("night_vision", str(states.get("night_vision")))
+        if "alarm_sound" in states:
+            self._paint_ezviz_mode("alarm_sound", str(states.get("alarm_sound")))
+        if "sens" in states:
+            self._paint_ezviz_mode("sens", str(states.get("sens")))
+        # Volume sliders (avoid feedback loop while user is dragging)
+        if not getattr(self, "_ezviz_vol_busy", False):
+            if "speaker_volume" in states and getattr(self, "_ezviz_spk_scale", None) is not None:
+                sp = int(states.get("speaker_volume") or 80)
+                self._ezviz_spk_scale.set(sp)
+                if getattr(self, "_ezviz_spk_lab", None) is not None:
+                    self._ezviz_spk_lab.configure(text=f"Alarm / speaker: {sp}%")
+            if "mic_volume" in states and getattr(self, "_ezviz_mic_scale", None) is not None:
+                mic = int(states.get("mic_volume") or 50)
+                self._ezviz_mic_scale.set(mic)
+                if getattr(self, "_ezviz_mic_lab", None) is not None:
+                    self._ezviz_mic_lab.configure(text=f"Microphone: {mic}%")
+
+    def _on_ezviz_spk_slide(self, raw) -> None:
+        try:
+            sp = int(float(raw))
+        except (TypeError, ValueError):
+            return
+        lab = getattr(self, "_ezviz_spk_lab", None)
+        if lab is not None:
+            lab.configure(text=f"Alarm / speaker: {sp}%")
+        self._schedule_ezviz_volume_apply()
+
+    def _on_ezviz_mic_slide(self, raw) -> None:
+        try:
+            mic = int(float(raw))
+        except (TypeError, ValueError):
+            return
+        lab = getattr(self, "_ezviz_mic_lab", None)
+        if lab is not None:
+            lab.configure(text=f"Microphone: {mic}%")
+        self._schedule_ezviz_volume_apply()
+
+    def _schedule_ezviz_volume_apply(self) -> None:
+        job = getattr(self, "_ezviz_vol_job", None)
+        if job is not None:
+            try:
+                self.after_cancel(job)
+            except Exception:
+                pass
+        self._ezviz_vol_job = self.after(800, self._apply_ezviz_volumes)
+
+    def _apply_ezviz_volumes(self) -> None:
+        if self._brand() != "ezviz":
+            return
+        ip = self.ip_e.get().strip()
+        if not ip:
+            self._set_status("Enter camera IP first")
+            return
+        sp = int(self._ezviz_spk_scale.get()) if getattr(self, "_ezviz_spk_scale", None) else 80
+        mic = int(self._ezviz_mic_scale.get()) if getattr(self, "_ezviz_mic_scale", None) else 50
+        self._ezviz_vol_busy = True
+        self._set_status(f"Setting volumes speaker {sp}% · mic {mic}%…")
+
+        def work() -> None:
+            try:
+                if not self._ezviz_cloud_blocking():
+                    self._ui(lambda: self._set_status("Sign in with EZVIZ app account first"))
+                    return
+                from v380.client.ezviz_session import set_audio_volumes
+
+                msg = set_audio_volumes(ip, speaker=sp, microphone=mic)
+                st = dict(getattr(self, "_ezviz_states", {}) or {})
+                st["speaker_volume"] = sp
+                st["mic_volume"] = mic
+                self._ui(lambda s=st: self._apply_ezviz_states(s))
+                self._ui(lambda m=msg: self._set_status(m))
+            except Exception as exc:
+                self._ui(lambda m=str(exc): self._set_status(f"Volume failed: {m}"))
+            finally:
+                self._ui(lambda: setattr(self, "_ezviz_vol_busy", False))
+
+        threading.Thread(target=work, daemon=True, name="ezviz-vol").start()
+
+    def _refresh_ezviz_states(self) -> None:
+        if self._brand() != "ezviz":
+            return
+        ip = self.ip_e.get().strip()
+        if not ip:
+            lab = getattr(self, "_ezviz_online_lab", None)
+            if lab is not None:
+                lab.configure(text="Enter camera IP, then states load automatically", fg=MUTED)
+            return
+        if getattr(self, "_ezviz_refreshing", False):
+            return
+        self._ezviz_refreshing = True
+        self._set_status("Reading EZVIZ feature states…")
+
+        def work() -> None:
+            try:
+                if not self._ezviz_cloud_blocking():
+                    self._ui(lambda: self._set_status("Sign in with EZVIZ app account first"))
+                    return
+                from v380.client.ezviz_session import get_feature_states
+
+                st = get_feature_states(ip)
+                st["siren"] = bool(getattr(self, "_ezviz_siren_local", False))
+                if self._ezviz_armed_local is not None:
+                    st["armed"] = self._ezviz_armed_local
+                self._ui(lambda s=st: self._apply_ezviz_states(s))
+                self._ui(
+                    lambda: self._set_status(
+                        "States updated — coloured = ON, grey = OFF"
+                    )
+                )
+            except Exception as exc:
+                self._ui(lambda m=str(exc): self._set_status(f"State refresh failed: {m}"))
+            finally:
+                self._ui(lambda: setattr(self, "_ezviz_refreshing", False))
+
+        threading.Thread(target=work, daemon=True, name="ezviz-states").start()
+
+    def _ezviz_toggle(self, key: str) -> None:
+        """Flip a boolean feature; button label shows new state after success."""
+        action_map = {
+            "privacy": ("privacy_on", "privacy_off"),
+            "sleep": ("sleep_on", "sleep_off"),
+            "track": ("track_on", "track_off"),
+            "cruise": ("cruise_on", "cruise_off"),
+            "feature_track": ("feature_track_on", "feature_track_off"),
+            "led": ("led_on", "led_off"),
+            "ir": ("ir_on", "ir_off"),
+            "flood": ("flood_on", "flood_off"),
+            "flicker": ("flicker_on", "flicker_off"),
+            "mic": ("mic_on", "mic_off"),
+            "logo": ("logo_on", "logo_off"),
+            "alarm_tone": ("alarm_tone_on", "alarm_tone_off"),
+            "human": ("human_on", "human_off"),
+            "allday": ("allday_on", "allday_off"),
+            "dnd": ("dnd_on", "dnd_off"),
+            "armed": ("arm", "disarm"),
+            "siren": ("siren_on", "siren_off"),
+        }
+        pair = action_map.get(key)
+        if not pair:
+            return
+        cur = bool((self._ezviz_states or {}).get(key))
+        if key == "siren":
+            cur = bool(getattr(self, "_ezviz_siren_local", False))
+        if key == "armed" and self._ezviz_armed_local is not None:
+            cur = bool(self._ezviz_armed_local)
+        name = pair[1] if cur else pair[0]
+        self._ezviz_action(name, state_key=key, new_state=not cur)
+
+    def _ezviz_set_mode(self, group: str, value: str) -> None:
+        if group == "night_vision":
+            name = {"0": "nv_bw", "1": "nv_color", "2": "nv_smart"}.get(str(value), "nv_smart")
+        elif group == "alarm_sound":
+            name = {"0": "sound_soft", "1": "sound_loud", "2": "sound_mute"}.get(str(value), "sound_soft")
+        elif group == "sens":
+            name = {"1": "sens_low", "3": "sens_mid", "6": "sens_high"}.get(str(value), "sens_mid")
+        else:
+            return
+        self._ezviz_action(name, mode_group=group, mode_value=value)
+
+    def _ezviz_action(
+        self,
+        name: str,
+        state_key: str | None = None,
+        new_state: bool | None = None,
+        mode_group: str | None = None,
+        mode_value: str | None = None,
+    ) -> None:
+        if self._brand() != "ezviz":
+            return
+        if not self.ip_e.get().strip():
+            self._set_status("Connect / enter camera IP first")
+            return
+        self._set_status(name.replace("_", " ") + "…")
+
+        def work() -> None:
+            try:
+                if not self._ezviz_cloud_blocking():
+                    self._ui(lambda: self._set_status("Sign in with EZVIZ app account first"))
+                    return
+                from v380.client.ezviz_session import run_action
+
+                msg = run_action(self.ip_e.get().strip(), name)
+                if name in ("siren_on", "alert_on"):
+                    self._ezviz_siren_local = True
+                if name in ("siren_off", "alert_off", "silence_all"):
+                    self._ezviz_siren_local = False
+                if name == "arm":
+                    self._ezviz_armed_local = True
+                if name == "disarm":
+                    self._ezviz_armed_local = False
+                if name == "silence_all":
+                    # reflect silenced switches locally
+                    st = dict(self._ezviz_states or {})
+                    st.update(
+                        {
+                            "siren": False,
+                            "flicker": False,
+                            "flood": False,
+                            "alarm_tone": False,
+                            "alarm_sound": 2,
+                        }
+                    )
+                    self._ui(lambda s=st: self._apply_ezviz_states(s))
+                elif state_key is not None and new_state is not None:
+                    st = dict(self._ezviz_states or {})
+                    st[state_key] = new_state
+                    if state_key == "siren":
+                        st["siren"] = new_state
+                    if state_key == "flicker":
+                        # strobe also drives flood light
+                        st["flood"] = bool(new_state)
+                    if state_key == "ir":
+                        st["night_vision"] = 0 if new_state else 2  # B&W / smart
+                    self._ui(lambda s=st: self._apply_ezviz_states(s))
+                elif mode_group is not None and mode_value is not None:
+                    st = dict(self._ezviz_states or {})
+                    if mode_group == "night_vision":
+                        st["night_vision"] = int(mode_value)
+                    elif mode_group == "alarm_sound":
+                        st["alarm_sound"] = int(mode_value)
+                    elif mode_group == "sens":
+                        st["sens"] = int(mode_value)
+                    self._ui(lambda s=st: self._apply_ezviz_states(s))
+                self._ui(lambda m=msg: self._set_status(m))
+            except Exception as exc:
+                self._ui(lambda m=str(exc): self._set_status(f"Failed: {m}"))
+
+        threading.Thread(target=work, daemon=True, name="ezviz-act").start()
 
     def _apply_camera(self, cam: Camera) -> None:
         self.brand_e.set(cam.brand_name)
@@ -636,6 +1142,10 @@ class LiveView(tk.Frame):
         self._quality_name = cam.quality_name
         self._reset_ptz_origin()
         self._on_brand_change()
+        if (getattr(cam, "brand", "") == "ezviz" or self._brand() == "ezviz") and cam.ip:
+            self.after(300, self._refresh_ezviz_states)
+        if self._brand() == "ezviz" and cam.ip:
+            self.after(300, self._refresh_ezviz_states)
 
     def _brand(self) -> str:
         return "ezviz" if self.brand_e.get() == "EZVIZ" else "v380"
@@ -643,6 +1153,25 @@ class LiveView(tk.Frame):
     def _on_brand_change(self) -> None:
         ez = self._brand() == "ezviz"
         self._pass_lab.configure(text="Verify code" if ez else "Password")
+        panel = getattr(self, "_ezviz_panel", None)
+        note = getattr(self, "_note_lab", None)
+        if panel is not None:
+            if ez:
+                if note is not None:
+                    panel.pack(fill="x", before=note)
+                else:
+                    panel.pack(fill="x")
+            else:
+                panel.pack_forget()
+        if note is not None:
+            note.configure(
+                text=(
+                    "Hold arrows to pan/tilt.\n"
+                    "EZVIZ app features are in the panels above."
+                    if ez
+                    else "Hold arrows to pan/tilt.\nScroll for light, image, alert."
+                )
+            )
         if ez:
             if self.port_e.get().strip() in ("", "8800"):
                 self.port_e.delete(0, "end")
@@ -650,7 +1179,10 @@ class LiveView(tk.Frame):
             if not self.user_e.get().strip():
                 self.user_e.insert(0, "admin")
             self.source_e.set("LAN")
-            self._set_status("EZVIZ: enable RTSP in app · password = 6-letter verification code · PTZ not supported yet")
+            self._set_status("EZVIZ: video via RTSP · controls via EZVIZ app account")
+            # Auto-load ON/OFF + volumes whenever the EZVIZ panel is shown
+            if self.ip_e.get().strip():
+                self.after(200, self._refresh_ezviz_states)
         else:
             if self.port_e.get().strip() == "554":
                 self.port_e.delete(0, "end")
@@ -661,6 +1193,11 @@ class LiveView(tk.Frame):
         ip = self.ip_e.get().strip()
         user = self.user_e.get().strip() or ("admin" if brand == "ezviz" else "")
         password = self.pass_e.get()
+        if brand == "ezviz":
+            # EZVIZ verification codes are case-sensitive; sticker codes are uppercase.
+            password = password.strip().upper()
+            self.pass_e.delete(0, "end")
+            self.pass_e.insert(0, password)
         quality_name = self.quality_e.get() or "HD"
         source = "lan" if brand == "ezviz" else ("cloud" if self.source_e.get() == "Cloud" else "lan")
         try:
@@ -720,21 +1257,91 @@ class LiveView(tk.Frame):
         self._set_status(f"Live  {label}  {self._quality_name}")
 
     def _discover(self) -> None:
-        self._set_status("Scanning LAN UDP 10008/10009 …")
+        self._set_status("Scanning LAN — V380 (UDP) + EZVIZ (ONVIF / RTSP :554) …")
 
         def work():
+            # Discover must run on a host that shares the camera LAN.
+            # Prefer this PC first (Windows UI on same Wi‑Fi), then merge
+            # server-side results (Linux box on the camera LAN).
+            by_key: dict[str, SimpleNamespace] = {}
+            errors: list[str] = []
+
+            def add_dev(*, mac: str, dev_id: str, ip: str, brand: str, rtsp_ready: bool = True) -> None:
+                ip = (ip or "").strip()
+                mac = (mac or "").strip()
+                dev_id = str(dev_id or "").strip()
+                # Always key by IP when present so local+server results do not duplicate.
+                key = ip or mac or dev_id
+                if not key:
+                    return
+                prev = by_key.get(key)
+                if prev is not None and getattr(prev, "brand", "") == "ezviz" and brand != "ezviz":
+                    return
+                by_key[key] = SimpleNamespace(
+                    mac=mac,
+                    dev_id=dev_id,
+                    ip=ip,
+                    brand=brand,
+                    rtsp_ready=bool(rtsp_ready) if prev is None else (bool(rtsp_ready) or bool(getattr(prev, "rtsp_ready", False))),
+                )
+
+            def add_local(devs, brand_default: str = "v380") -> None:
+                for d in devs:
+                    brand = str(getattr(d, "brand", "") or brand_default)
+                    add_dev(
+                        mac=getattr(d, "mac", "") or "",
+                        dev_id=str(getattr(d, "dev_id", "") or ""),
+                        ip=getattr(d, "ip", "") or "",
+                        brand=brand,
+                        rtsp_ready=bool(getattr(d, "rtsp_ready", brand != "ezviz")),
+                    )
+
+            def add_remote(rows: list[dict]) -> None:
+                for d in rows:
+                    brand = str(d.get("brand") or "v380")
+                    add_dev(
+                        mac=d.get("mac") or "",
+                        dev_id=str(d.get("device_id") or ""),
+                        ip=d.get("ip") or "",
+                        brand=brand,
+                        rtsp_ready=bool(d.get("rtsp_ready", brand != "ezviz")),
+                    )
+
             try:
-                if self._api is not None:
-                    raw = self._api.discover()
-                    devs = [SimpleNamespace(mac=d.get("mac") or "", dev_id=str(d.get("device_id") or ""), ip=d.get("ip") or "") for d in raw]
-                else:
-                    devs = discover_devices()
+                add_local(discover_devices(), "v380")
             except Exception as exc:
-                self._ui( lambda: self._set_status(f"Discover failed: {exc}"))
+                errors.append(f"v380: {exc}")
+            try:
+                from v380.client.ezviz_rtsp import discover_ezviz_devices
+
+                add_local(discover_ezviz_devices(), "ezviz")
+            except Exception as exc:
+                errors.append(f"ezviz: {exc}")
+            if self._api is not None:
+                try:
+                    add_remote(self._api.discover())
+                except Exception as exc:
+                    errors.append(f"server: {exc}")
+
+            # Prefer EZVIZ-first when user already selected that brand.
+            prefer_ez = self._brand() == "ezviz"
+            devs = sorted(
+                by_key.values(),
+                key=lambda d: (0 if (getattr(d, "brand", "") == "ezviz") == prefer_ez else 1, d.ip or ""),
+            )
+            if not devs and errors:
+                self._ui(lambda: self._set_status(f"Discover failed: {'; '.join(errors)}"))
                 return
             self._devices = devs
-            labels = [f"{d.dev_id}  {d.ip}  {d.mac}" for d in devs]
-            self._ui( lambda: self._show_devices(labels))
+            labels = []
+            for d in devs:
+                tag = "EZVIZ" if getattr(d, "brand", "") == "ezviz" else "V380"
+                mac = f"  {d.mac}" if d.mac else ""
+                note = ""
+                if getattr(d, "brand", "") == "ezviz" and not getattr(d, "rtsp_ready", True):
+                    note = "  (RTSP off)"
+                labels.append(f"[{tag}] {d.ip}  {d.dev_id}{mac}{note}")
+            self._ui(lambda: self._show_devices(labels))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -743,24 +1350,47 @@ class LiveView(tk.Frame):
         if labels:
             self.cam_box.set(labels[0])
             self._pick_device()
-            self._set_status(f"Found {len(labels)} camera(s). Pick one, enter password, Connect.")
+            need_rtsp = any(
+                getattr(d, "brand", "") == "ezviz" and not getattr(d, "rtsp_ready", True) for d in self._devices
+            )
+            if need_rtsp:
+                self._set_status(
+                    f"Found {len(labels)} camera(s). EZVIZ RTSP is OFF — enable it in app "
+                    "(LAN Live View → camera → Local Server Settings → RTSP), then Connect."
+                )
+            else:
+                self._set_status(
+                    f"Found {len(labels)} camera(s). For EZVIZ enter the 6-letter verification code, then Connect."
+                )
         else:
-            self._set_status("No cameras found. Check LAN / UDP 10008.")
+            self._set_status(
+                "No cameras found. EZVIZ: enable RTSP in app (LAN Live View). Same Wi‑Fi as this PC?"
+            )
 
     def _pick_device(self, _evt=None) -> None:
         idx = self.cam_box.current()
         if idx < 0 or idx >= len(self._devices):
             return
         d = self._devices[idx]
+        brand = getattr(d, "brand", "") or "v380"
+        self.brand_e.set("EZVIZ" if brand == "ezviz" else "V380")
+        self._on_brand_change()
         self.ip_e.delete(0, "end")
         self.ip_e.insert(0, d.ip)
         self.id_e.delete(0, "end")
         self.id_e.insert(0, d.dev_id)
         self.user_e.delete(0, "end")
-        self.user_e.insert(0, d.dev_id)
+        if brand == "ezviz":
+            self.user_e.insert(0, "admin")
+        else:
+            self.user_e.insert(0, d.dev_id)
         if not self.name_e.get().strip():
             self.name_e.insert(0, d.dev_id)
         self._pending_mac = d.mac
+        if brand == "ezviz" and not getattr(d, "rtsp_ready", True):
+            self._set_status(
+                f"Camera {d.ip} found, but RTSP port 554 is closed. Enable RTSP in EZVIZ app, then Connect."
+            )
 
     def _apply_ptz_mode(self) -> None:
         mode = self._ptz_mode.get() if hasattr(self, "_ptz_mode") else "both"
@@ -796,15 +1426,115 @@ class LiveView(tk.Frame):
 
     def _ptz_ready(self) -> bool:
         if self._brand() == "ezviz":
-            return False
+            return bool(self.ip_e.get().strip())
         if self._api is not None and self._cam_id:
             return True
         client = self._client
         return client is not None and hasattr(client, "send_control")
 
+    def _ensure_ezviz_cloud(self) -> bool:
+        if self._ezviz_ready:
+            return True
+        from v380.client import ezviz_session as ez
+        from v380.ui.ezviz_account import ask_ezviz_account
+
+        try:
+            ez.get_client()
+            self._ezviz_ready = True
+            if self._brand() == "ezviz" and self.ip_e.get().strip():
+                self.after(100, self._refresh_ezviz_states)
+            return True
+        except Exception:
+            pass
+        creds = ask_ezviz_account(self)
+        if not creds or not creds[0] or not creds[1]:
+            return False
+        acc, pw, sms = creds
+        try:
+            ez.login(acc, pw, sms or None)
+            self._ezviz_ready = True
+            self._set_status("EZVIZ account signed in — loading feature states…")
+            if self.ip_e.get().strip():
+                self.after(100, self._refresh_ezviz_states)
+            return True
+        except Exception as exc:
+            msg = str(exc)
+            if "MFA" in msg or "verification" in msg.lower() or "retry with code" in msg.lower():
+                from tkinter import simpledialog
+
+                code = simpledialog.askstring("EZVIZ 2FA", "Enter the SMS code sent by EZVIZ:", parent=self)
+                if code:
+                    try:
+                        ez.login(acc, pw, code)
+                        self._ezviz_ready = True
+                        self._set_status("EZVIZ account signed in")
+                        if self.ip_e.get().strip():
+                            self.after(100, self._refresh_ezviz_states)
+                        return True
+                    except Exception as exc2:
+                        messagebox.showerror("EZVIZ account", str(exc2))
+                        return False
+            messagebox.showerror("EZVIZ account", msg)
+            return False
+
+    def _ezviz_cloud_blocking(self) -> bool:
+        if self._ezviz_ready:
+            return True
+        done = threading.Event()
+        ok = [False]
+
+        def run() -> None:
+            try:
+                ok[0] = self._ensure_ezviz_cloud()
+            finally:
+                done.set()
+
+        self.after(0, run)
+        done.wait(120)
+        return bool(ok[0])
+
+    def _send_ezviz_cmd(self, name: str, hold: float = 0.0) -> bool:
+        from v380.client import ezviz_session as ez
+
+        ip = self.ip_e.get().strip()
+        if not ip:
+            return False
+        if name.startswith("ptz_"):
+            if name == "ptz_stop":
+                last = (self._ptz_last_cmd or "up").replace("ptz_", "").upper()
+                dirs = ["UP", "DOWN", "LEFT", "RIGHT"]
+                if last in dirs:
+                    dirs.insert(0, last)
+                seen: set[str] = set()
+                for d in dirs:
+                    if d in seen:
+                        continue
+                    seen.add(d)
+                    try:
+                        ez.ptz(ip, d, "STOP")
+                    except Exception:
+                        pass
+                return True
+            d = name.replace("ptz_", "").upper()
+            if d not in ("UP", "DOWN", "LEFT", "RIGHT"):
+                return False
+            ez.ptz(ip, d, "START")
+            if hold > 0.05:
+                time.sleep(hold)
+                ez.ptz(ip, d, "STOP")
+            return True
+        # light / image / alert aliases + full app feature set
+        ez.run_action(ip, name)
+        return True
+
+    def _send_ezviz_ptz(self, name: str, hold: float = 0.0) -> bool:
+        return self._send_ezviz_cmd(name, hold=hold)
+
     def _send_control_sync(self, name: str, hold: float = 0.0) -> bool:
         """Prefer a live TCP client with send_control; otherwise studio API (optional hold)."""
         try:
+            if self._brand() == "ezviz":
+                return self._send_ezviz_cmd(name, hold=hold)
             client = self._client
             hold = float(hold or 0)
             if client is not None and hasattr(client, "send_control"):
@@ -871,9 +1601,6 @@ class LiveView(tk.Frame):
         return ok
 
     def _calibrate_ptz(self) -> None:
-        if self._brand() == "ezviz":
-            self._set_status("PTZ is not supported on EZVIZ yet")
-            return
         if not self._ptz_ready():
             self._set_status("Connect first, then Calibrate")
             return
@@ -893,6 +1620,10 @@ class LiveView(tk.Frame):
         def work() -> None:
             ok = False
             try:
+                if self._brand() == "ezviz" and not self._ezviz_cloud_blocking():
+                    self._ui(lambda: self._set_status("Sign in with EZVIZ app account to calibrate"))
+                    self._ptz_busy = False
+                    return
                 # Single-start continuous moves (identical to joystick hold).
                 # Durations long enough to hit mechanical stops at full motor speed.
                 steps = (
@@ -931,10 +1662,6 @@ class LiveView(tk.Frame):
         threading.Thread(target=work, daemon=True, name="ptz-calibrate").start()
 
     def _cmd(self, name: str, resync: bool | None = None) -> None:
-        if self._brand() == "ezviz":
-            if name != "ptz_stop":
-                self._set_status("PTZ is not supported on EZVIZ yet")
-            return
         # Only resync after movement ends — resyncing on every tick causes lag/gray.
         if resync is None:
             resync = name == "ptz_stop"
@@ -946,18 +1673,154 @@ class LiveView(tk.Frame):
 
         def work() -> None:
             try:
+                if self._brand() == "ezviz" and not self._ezviz_cloud_blocking():
+                    self._ui(lambda: self._set_status("Sign in with EZVIZ app email/password to move / light / alert"))
+                    return
                 ok = self._send_control_sync(name)
                 if name != "ptz_stop" and not ok:
-                    self._ui(lambda: self._set_status(f"Control failed: {name}"))
+                    if self._brand() == "ezviz":
+                        self._ui(
+                            lambda: self._set_status(
+                                "Control failed — check EZVIZ account login and that this camera is on that account"
+                            )
+                        )
+                    else:
+                        self._ui(lambda: self._set_status(f"Control failed: {name}"))
             except Exception as exc:
                 self._ui(lambda: self._set_status(f"Control failed: {exc}"))
 
         # Fire immediately — do not wait behind other UI jobs.
         threading.Thread(target=work, daemon=True, name="ptz-cmd").start()
 
+    def _toggle_alert_wav(self) -> None:
+        """Play / stop only audio/alert.wav (not the EZVIZ cloud siren)."""
+        if getattr(self, "_alert_wav_playing", False):
+            self._stop_alert_wav()
+            return
+        self._play_alert_wav()
+
+    def _play_alert_wav(self) -> None:
+        from v380.client.extras import ALERT_WAV
+
+        if not ALERT_WAV.is_file():
+            self._set_status(f"Missing file: {ALERT_WAV}")
+            return
+
+        self._alert_wav_playing = True
+        btn = getattr(self, "_alert_wav_btn", None)
+        if btn is not None:
+            btn.configure(text="Stop camera sound", bg=RED)
+
+        ip = self.ip_e.get().strip()
+        brand = self._brand()
+
+        def work() -> None:
+            try:
+                if brand == "ezviz":
+                    if not self._ezviz_cloud_blocking():
+                        self._ui(lambda: self._set_status("Sign in with EZVIZ app account first"))
+                        self._ui(self._alert_wav_btn_reset)
+                        return
+                    from v380.client.ezviz_alert_wav import play_alert_on_camera
+
+                    msg = play_alert_on_camera(ip, ALERT_WAV)
+                    self._ezviz_siren_local = "siren" in msg.lower() or "Playing" in msg
+                    self._ui(lambda m=msg: self._set_status(m))
+                    # auto-stop siren fallback after ~12s
+                    if "siren ON" in msg:
+                        self._ui(lambda: self.after(12000, self._stop_alert_wav))
+                    return
+
+                # V380 (or API talk client): send WAV through camera talk channel only
+                client = self._client
+                if client is None or not hasattr(client, "send_talk_audio"):
+                    self._ui(lambda: self._set_status("Connect the camera first to play on its speaker"))
+                    self._ui(self._alert_wav_btn_reset)
+                    return
+                ok = bool(self._alert.start(client))
+                if not ok:
+                    self._ui(lambda: self._set_status("Camera talk failed — cannot play alert.wav on speaker"))
+                    self._ui(self._alert_wav_btn_reset)
+                    return
+                self._ui(lambda: self._set_status("Playing audio/alert.wav on camera speaker"))
+                if self._alert_job is not None:
+                    try:
+                        self.after_cancel(self._alert_job)
+                    except Exception:
+                        pass
+                self._ui(lambda: setattr(self, "_alert_job", self.after(60000, self._stop_alert_wav)))
+            except Exception as exc:
+                self._ui(lambda m=str(exc): self._set_status(f"Play failed: {m}"))
+                self._ui(self._alert_wav_btn_reset)
+
+        threading.Thread(target=work, daemon=True, name="alert-wav-cam").start()
+
+    def _alert_wav_btn_reset(self) -> None:
+        self._alert_wav_playing = False
+        btn = getattr(self, "_alert_wav_btn", None)
+        if btn is not None:
+            btn.configure(text="Play alert.wav on camera", bg=ORANGE)
+
+    def _alert_wav_btn_idle_if_pc_only(self) -> None:
+        self._alert_wav_btn_reset()
+
+    def _stop_alert_wav(self) -> None:
+        self._alert_wav_playing = False
+        if self._alert_job is not None:
+            try:
+                self.after_cancel(self._alert_job)
+            except Exception:
+                pass
+            self._alert_job = None
+        try:
+            self._alert.stop()
+        except Exception:
+            pass
+        if self._brand() == "ezviz":
+            ip = self.ip_e.get().strip()
+
+            def work() -> None:
+                try:
+                    from v380.client.ezviz_alert_wav import stop_alert_on_camera
+
+                    stop_alert_on_camera(ip)
+                except Exception:
+                    pass
+                self._ezviz_siren_local = False
+
+            threading.Thread(target=work, daemon=True, name="alert-wav-stop").start()
+        btn = getattr(self, "_alert_wav_btn", None)
+        if btn is not None:
+            btn.configure(text="Play alert.wav on camera", bg=ORANGE)
+        self._set_status("Camera alert sound stopped")
+
     def _alert_on(self) -> None:
         if self._brand() == "ezviz":
-            self._set_status("Alert is not supported on EZVIZ yet")
+            if not self._ensure_ezviz_cloud():
+                return
+            ip = self.ip_e.get().strip()
+            self._set_status("Alert ON")
+            if self._alert_job is not None:
+                try:
+                    self.after_cancel(self._alert_job)
+                except Exception:
+                    pass
+            self._alert_job = self.after(20000, self._alert_auto_off)
+
+            def work() -> None:
+                try:
+                    from v380.client.ezviz_session import sound_alarm
+
+                    sound_alarm(ip, True)
+                    self._ezviz_siren_local = True
+                    st = dict(getattr(self, "_ezviz_states", {}) or {})
+                    st["siren"] = True
+                    self._ui(lambda s=st: self._apply_ezviz_states(s))
+                    self._ui(lambda: self._set_status("Siren / alert ON"))
+                except Exception as exc:
+                    self._ui(lambda m=str(exc): self._set_status(f"Alert failed: {m}"))
+
+            threading.Thread(target=work, daemon=True, name="ezviz-alert").start()
             return
         if self._api is not None and self._cam_id:
             cam_id = self._cam_id
@@ -998,7 +1861,24 @@ class LiveView(tk.Frame):
         if self._api is not None and self._cam_id:
             cam_id = self._cam_id
             self._bg(lambda: self._api.alert(cam_id, False))
+        if self._brand() == "ezviz":
+            ip = self.ip_e.get().strip()
+
+            def work() -> None:
+                try:
+                    from v380.client.ezviz_session import sound_alarm
+
+                    sound_alarm(ip, False)
+                    self._ezviz_siren_local = False
+                    st = dict(getattr(self, "_ezviz_states", {}) or {})
+                    st["siren"] = False
+                    self._ui(lambda s=st: self._apply_ezviz_states(s))
+                except Exception:
+                    pass
+
+            threading.Thread(target=work, daemon=True, name="ezviz-alert-off").start()
         self._alert.stop()
+        self._alert_wav_btn_reset()
         self._set_status("Alert off")
 
     def _alert_auto_off(self) -> None:
@@ -1008,6 +1888,14 @@ class LiveView(tk.Frame):
                 cam_id = self._cam_id
                 self._bg(lambda: self._api.alert(cam_id, False))
             self._alert.stop()
+            if self._brand() == "ezviz":
+                ip = self.ip_e.get().strip()
+                try:
+                    from v380.client.ezviz_session import sound_alarm
+
+                    sound_alarm(ip, False)
+                except Exception:
+                    pass
             self._set_status("Alert off")
 
     def _set_zoom(self, value: float) -> None:
@@ -1015,7 +1903,10 @@ class LiveView(tk.Frame):
         self._set_status(f"Zoom {self._view_zoom:.0%}")
 
     def _zoom_hold(self, cmd: str, step: float) -> None:
+        # Digital zoom always works; hardware zoom only when the camera exposes PTZ.
         self._set_zoom(self._view_zoom + step)
+        if self._brand() == "ezviz":
+            return
         self._cmd(cmd)
 
     def _zoom_reset(self) -> None:
@@ -1026,6 +1917,9 @@ class LiveView(tk.Frame):
         self._set_zoom(self._view_zoom + step)
 
     def _toggle_dual(self) -> None:
+        if self._brand() == "ezviz":
+            self._set_status("Dual view is for V380 dual-lens cameras only")
+            return
         if self._dual_mode == "off":
             self._set_dual_mode("split")
         else:
@@ -1075,14 +1969,74 @@ class LiveView(tk.Frame):
         self._player.enabled = not self._player.enabled
         self.listen_btn.configure(text="Listen ON" if self._player.enabled else "Listen OFF", bg=GREEN if self._player.enabled else "#243040")
         if self._player.enabled:
-            ac = "IMA ADPCM" if self._client and self._client.audio_codec == "ima" else "G.711"
-            self._set_status(f"Listen ON ({ac}, 8 kHz) — use PC speakers")
+            if self._brand() == "ezviz":
+                ip = self.ip_e.get().strip()
+                self._set_status("Listen ON — camera microphone through speakers")
+
+                def work() -> None:
+                    try:
+                        if self._ezviz_cloud_blocking():
+                            from v380.client.ezviz_session import enable_mic
+
+                            enable_mic(ip, True)
+                    except Exception:
+                        pass
+
+                threading.Thread(target=work, daemon=True, name="ezviz-listen").start()
+            else:
+                ac = "IMA ADPCM" if self._client and getattr(self._client, "audio_codec", "") == "ima" else "G.711"
+                self._set_status(f"Listen ON ({ac}, 8 kHz) — use PC speakers")
         else:
             self._set_status("Listen off")
 
     def _toggle_talk(self) -> None:
         if self._brand() == "ezviz":
-            self._set_status("Talk is not supported on EZVIZ yet")
+            if not self._ensure_ezviz_cloud():
+                return
+            ip = self.ip_e.get().strip()
+            turning_on = self.talk_btn.cget("text") != "Talk ON"
+            if turning_on:
+                self.talk_btn.configure(text="Talk ON", bg=GREEN)
+                if not self._player.enabled:
+                    self._toggle_listen()
+                self._set_status("Talk: enables camera mic path. Use Alert / Siren for alarm sound — Talk does not sound the siren.")
+
+                def work() -> None:
+                    try:
+                        from pyezviz.constants import DeviceSwitchType
+
+                        from v380.client.ezviz_session import set_switch
+
+                        try:
+                            set_switch(ip, DeviceSwitchType.SOUND.value, True)
+                        except Exception:
+                            pass
+                        try:
+                            set_switch(ip, DeviceSwitchType.DOORBELL_TALK.value, True)
+                        except Exception:
+                            pass
+                    except Exception as exc:
+                        self._ui(lambda m=str(exc): self._set_status(f"Talk failed: {m}"))
+
+                threading.Thread(target=work, daemon=True, name="ezviz-talk").start()
+            else:
+                self.talk_btn.configure(text="Talk OFF", bg="#243040")
+                self._set_status("Talk off")
+
+                def work() -> None:
+                    try:
+                        from pyezviz.constants import DeviceSwitchType
+
+                        from v380.client.ezviz_session import set_switch
+
+                        try:
+                            set_switch(ip, DeviceSwitchType.DOORBELL_TALK.value, False)
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+
+                threading.Thread(target=work, daemon=True, name="ezviz-talk-off").start()
             return
         if self._talker.enabled:
             self._talker.enabled = False
@@ -1177,6 +2131,9 @@ class LiveView(tk.Frame):
         self._set_status(f"Snapshot saved  {path}")
 
     def _toggle_record(self) -> None:
+        if self._brand() == "ezviz":
+            self._toggle_ezviz_record()
+            return
         if self._recorder.active:
             out = self._recorder.stop()
             self.rec_btn.configure(text="Record", bg=RED)
@@ -1189,6 +2146,29 @@ class LiveView(tk.Frame):
             path = self._recorder.start(fmt)
             self.rec_btn.configure(text="Stop rec", bg="#7f1d1d")
             self._set_status(f"Recording…  {path.name}")
+
+    def _toggle_ezviz_record(self) -> None:
+        from v380.client.ezviz_rtsp import EzvizRtspRecorder
+
+        if self._ezviz_recorder is not None and self._ezviz_recorder.active:
+            out = self._ezviz_recorder.stop()
+            self._ezviz_recorder = None
+            self.rec_btn.configure(text="Record", bg=RED)
+            self._set_status(f"Recording saved  {out}" if out else "Recording stopped (empty)")
+            return
+        client = self._client
+        url = getattr(client, "url", "") if client is not None else ""
+        if not url:
+            self._set_status("Connect first, then Record")
+            return
+        try:
+            rec = EzvizRtspRecorder(REC_DIR)
+            path = rec.start(url)
+            self._ezviz_recorder = rec
+            self.rec_btn.configure(text="Stop rec", bg="#7f1d1d")
+            self._set_status(f"Recording EZVIZ RTSP…  {path.name}")
+        except Exception as exc:
+            self._set_status(f"Record failed: {exc}")
 
     def _open_folder(self) -> None:
         REC_DIR.mkdir(parents=True, exist_ok=True)
@@ -1324,13 +2304,26 @@ class LiveView(tk.Frame):
         while not self._stop.is_set():
             client = None
             try:
-                client = EzvizRtspClient(url)
+                client = EzvizRtspClient(
+                    url,
+                    ip=fields["ip"],
+                    username=fields["username"],
+                    password=fields["password"],
+                )
+                client.set_audio_callback(lambda pcm, rate=8000: self._player.play_pcm(pcm, rate=rate))
                 client.connect()
                 self._client = client
                 if not self._saved_once and self._on_connected is not None:
                     self._saved_once = True
                     self._ui(lambda f=fields: self._on_connected(f))
                 self._ui(lambda: self._set_codec("JPEG / RTSP"))
+                self._ui(lambda: self._ensure_ezviz_cloud())
+                # _ensure_ezviz_cloud already schedules a state refresh when IP is set
+                self._ui(
+                    lambda: self._set_status(
+                        "EZVIZ live — toggles auto-refresh after sign-in. Use STOP ALL ALARMS if it beeps."
+                    )
+                )
                 for kind, _is_iframe, payload in client.iter_video_frames(self._stop):
                     if kind != "video" or not payload:
                         continue
@@ -1382,6 +2375,15 @@ class LiveView(tk.Frame):
             return "Invalid username"
         if "invalid device" in low:
             return "Invalid device ID"
+        if "rtsp port" in low and "closed" in low:
+            return err
+        if "enable" in low and "rtsp" in low:
+            return err
+        if str(probe.get("brand") or "").lower() == "ezviz" or "rtsp" in low:
+            if probe.get("reachable") and not probe.get("online"):
+                return err or "EZVIZ online but RTSP failed — enable RTSP in EZVIZ app"
+            if not probe.get("reachable"):
+                return f"EZVIZ unreachable — {err or 'check IP / Wi‑Fi'}"
         if not probe.get("reachable"):
             return f"Camera offline — {err or 'unreachable'}"
         return f"Login failed — {err or 'unknown error'}"
@@ -1513,7 +2515,9 @@ class LiveView(tk.Frame):
 
     def _disconnect(self) -> None:
         self._stop.set()
-        if self._recorder.active:
+        if self._ezviz_recorder is not None and self._ezviz_recorder.active:
+            self._toggle_ezviz_record()
+        elif self._recorder.active:
             self._toggle_record()
         if self._client is not None:
             try:
@@ -1694,6 +2698,12 @@ class LiveView(tk.Frame):
         self._alive = False
         self._stop.set()
         self._jobs.put(None)
+        if self._ezviz_recorder is not None and self._ezviz_recorder.active:
+            try:
+                self._ezviz_recorder.stop()
+            except Exception:
+                pass
+            self._ezviz_recorder = None
         if self._recorder.active:
             self._recorder.stop()
         if self._client is not None:

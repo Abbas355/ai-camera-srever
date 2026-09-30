@@ -875,20 +875,50 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/discover":
             discover = MODS["discover"]
+            out = []
+            seen: set[str] = set()
             try:
                 devices = list(discover()) if discover else []
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, 500)
                 return
-            out = []
             for device in devices:
-                out.append(
-                    {
-                        "mac": pick(device, "mac", default="") or "",
-                        "device_id": str(pick(device, "dev_id", "device_id", "dev_id", default="") or ""),
-                        "ip": pick(device, "ip", default="") or "",
+                ip = pick(device, "ip", default="") or ""
+                mac = pick(device, "mac", default="") or ""
+                did = str(pick(device, "dev_id", "device_id", "dev_id", default="") or "")
+                key = ip or mac or did
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append({"mac": mac, "device_id": did, "ip": ip, "brand": "v380"})
+            try:
+                from v380.client.ezviz_rtsp import discover_ezviz_devices
+
+                for device in discover_ezviz_devices():
+                    ip = getattr(device, "ip", "") or ""
+                    mac = getattr(device, "mac", "") or ""
+                    did = str(getattr(device, "dev_id", "") or "")
+                    key = ip or mac or did
+                    row = {
+                        "mac": mac,
+                        "device_id": did,
+                        "ip": ip,
+                        "brand": "ezviz",
+                        "rtsp_ready": bool(getattr(device, "rtsp_ready", False)),
                     }
-                )
+                    if key in seen:
+                        for existing in out:
+                            if (existing.get("ip") or existing.get("mac") or existing.get("device_id")) == key:
+                                existing["brand"] = "ezviz"
+                                existing["rtsp_ready"] = row["rtsp_ready"] or bool(existing.get("rtsp_ready"))
+                                if mac and not existing.get("mac"):
+                                    existing["mac"] = mac
+                                break
+                        continue
+                    seen.add(key)
+                    out.append(row)
+            except Exception:
+                pass
             self.send_json({"ok": True, "devices": out})
             return
         if path == "/api/cameras":

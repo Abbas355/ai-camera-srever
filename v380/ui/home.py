@@ -59,9 +59,15 @@ def _friendly_probe_error(probe: dict) -> str:
         return "Invalid username"
     if "invalid device" in low:
         return "Invalid device ID"
+    if "rtsp port" in low and "closed" in low:
+        return err
+    if "enable" in low and "rtsp" in low:
+        return err
     if "rtsp" in low or str(probe.get("brand") or "").lower() == "ezviz":
+        if probe.get("reachable") and not probe.get("online"):
+            return err or "EZVIZ online but RTSP failed — enable RTSP in EZVIZ app"
         if not probe.get("reachable"):
-            return f"EZVIZ offline — {err or 'unreachable on :554'}"
+            return f"EZVIZ unreachable — {err or 'check IP / Wi‑Fi'}"
         return f"EZVIZ RTSP failed — {err or 'enable LAN Live View / RTSP in EZVIZ app'}"
     if not probe.get("reachable"):
         return f"Camera offline — {err or 'unreachable'}"

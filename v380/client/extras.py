@@ -32,37 +32,95 @@ class DeviceInfo:
     gateway: str = ""
 
 
-def discover_devices(retries: int = 5) -> list[DeviceInfo]:
+def _lan_broadcasts() -> list[str]:
+    """Global + /24 broadcasts for each local IPv4 (Windows multi-NIC safe)."""
+    targets: list[str] = ["255.255.255.255"]
+    seen: set[str] = set(targets)
+    try:
+        hostname = socket.gethostname()
+        for info in socket.getaddrinfo(hostname, None, socket.AF_INET, socket.SOCK_DGRAM):
+            ip = info[4][0]
+            if not ip or ip.startswith("127."):
+                continue
+            parts = ip.split(".")
+            if len(parts) != 4:
+                continue
+            bcast = f"{parts[0]}.{parts[1]}.{parts[2]}.255"
+            if bcast not in seen:
+                seen.add(bcast)
+                targets.append(bcast)
+    except OSError:
+        pass
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            probe.connect(("8.8.8.8", 80))
+            ip = probe.getsockname()[0]
+        finally:
+            probe.close()
+        if ip and not ip.startswith("127."):
+            parts = ip.split(".")
+            if len(parts) == 4:
+                bcast = f"{parts[0]}.{parts[1]}.{parts[2]}.255"
+                if bcast not in seen:
+                    targets.append(bcast)
+    except OSError:
+        pass
+    return targets
+
+
+def discover_devices(retries: int = 8, listen_s: float = 1.0) -> list[DeviceInfo]:
+    """UDP LAN discover: broadcast NVDEVSEARCH on :10008, listen on :10009."""
     devices: list[DeviceInfo] = []
     seen: set[str] = set()
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    sock.settimeout(0.25)
+    # Official client pads to 256 bytes; some firmwares ignore the short form.
+    payload = b"NVDEVSEARCH^100" + b"\x00" * (256 - len(b"NVDEVSEARCH^100"))
+    broadcasts = _lan_broadcasts()
+    listen = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    listen.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listen.settimeout(0.35)
+    send = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    send.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    send.settimeout(0.35)
     try:
-        sock.bind(("0.0.0.0", 10009))
-        payload = b"NVDEVSEARCH^100"
-        for _ in range(retries):
-            sock.sendto(payload, ("255.255.255.255", 10008))
-            deadline = time.time() + 0.25
+        try:
+            listen.bind(("", 10009))
+        except OSError as exc:
+            raise RuntimeError(
+                "UDP port 10009 is in use (close the official V380 app / another Studio instance)."
+            ) from exc
+        for _ in range(max(1, retries)):
+            for bcast in broadcasts:
+                try:
+                    send.sendto(payload, (bcast, 10008))
+                except OSError:
+                    continue
+            deadline = time.time() + max(0.4, listen_s)
             while time.time() < deadline:
                 try:
-                    data, _addr = sock.recvfrom(2048)
+                    data, _addr = listen.recvfrom(4096)
                 except socket.timeout:
-                    break
-                text = data.decode("ascii", errors="ignore")
+                    continue
+                text = data.split(b"\x00", 1)[0].decode("ascii", errors="ignore")
                 parts = text.split("^")
                 if len(parts) < 13 or parts[0] != "NVDEVRESULT":
                     continue
-                mac = parts[2]
-                if mac in seen:
+                mac = parts[2].strip()
+                if not mac or mac in seen:
                     continue
                 seen.add(mac)
                 devices.append(
-                    DeviceInfo(mac=mac, dev_id=parts[12], ip=parts[3], subnet=parts[4], gateway=parts[5])
+                    DeviceInfo(
+                        mac=mac,
+                        dev_id=parts[12].strip(),
+                        ip=parts[3].strip(),
+                        subnet=parts[4].strip(),
+                        gateway=parts[5].strip(),
+                    )
                 )
     finally:
-        sock.close()
+        listen.close()
+        send.close()
     return devices
 
 
@@ -274,13 +332,41 @@ class AlawPlayer:
             return
         if not self._ensure():
             return
-        pcm = ima_adpcm_to_pcm16(data) if codec == "ima" else alaw_to_pcm16(data)
+        if codec == "pcm":
+            pcm = data
+        else:
+            pcm = ima_adpcm_to_pcm16(data) if codec == "ima" else alaw_to_pcm16(data)
         if not pcm:
             return
         try:
             self._stream.write(pcm)
         except Exception:
             pass
+
+    def play_pcm(self, pcm: bytes, rate: int = 8000) -> None:
+        """Play raw s16le mono PCM (used by EZVIZ RTSP audio)."""
+        if not self.enabled or not pcm:
+            return
+        if rate != 8000:
+            # crude downsample / upsample by stride
+            try:
+                import array
+
+                src = array.array("h")
+                src.frombytes(pcm)
+                if not src:
+                    return
+                step = rate / 8000.0
+                out = array.array("h")
+                i = 0.0
+                n = len(src)
+                while int(i) < n:
+                    out.append(src[int(i)])
+                    i += step
+                pcm = out.tobytes()
+            except Exception:
+                pass
+        self.play(pcm, codec="pcm")
 
     def close(self) -> None:
         if self._stream is not None:

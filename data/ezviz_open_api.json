@@ -1,0 +1,5 @@
+{
+  "app_key": "",
+  "app_secret": "",
+  "_comment": "Optional EZVIZ Open Platform credentials from https://open.ezvizlife.com — needed to play audio/alert.wav on the camera speaker. Leave empty to use built-in camera siren instead."
+}
