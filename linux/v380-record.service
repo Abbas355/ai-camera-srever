@@ -1,0 +1,14 @@
+[Unit]
+Description=Optiview auto-record (legacy name → use optiview-record)
+After=network.target
+
+[Service]
+Type=simple
+Environment=TZ=Asia/Karachi
+WorkingDirectory=/opt/optiview
+ExecStart=/opt/optiview/.venv/bin/python /opt/optiview/record_worker.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

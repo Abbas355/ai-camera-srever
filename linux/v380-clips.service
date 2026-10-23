@@ -1,0 +1,14 @@
+[Unit]
+Description=Optiview recordings API (legacy name → use optiview-api)
+After=network.target
+
+[Service]
+Type=simple
+Environment=TZ=Asia/Karachi
+WorkingDirectory=/opt/optiview
+ExecStart=/opt/optiview/.venv/bin/python /opt/optiview/clip_server.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

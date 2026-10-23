@@ -1,0 +1,1219 @@
+"""LAN V380 client: TCP :8800 auth, stream, decrypt, I-frame snapshots."""
+
+from __future__ import annotations
+
+import queue
+import random
+import socket
+import subprocess
+import sys
+import threading
+import string
+import struct
+import tempfile
+import time
+from pathlib import Path
+
+from Crypto.Cipher import AES
+
+STATIC_PW_KEY = b"macrovideo+*#!^@"
+MEDIA_KEY_MID = 0x618123462C14795C
+MEDIA_KEY_TAIL = 0x82800DF0
+
+COMMANDS = {
+    "ptz_right": bytes([0xAA, 0x00, 0x00, 0x00, 0xE8, 0x03, 0xE8, 0x03, 0xEA, 0x03, 0xE8, 0x03, 0x00, 0x00, 0x01, 0x00]),
+    "ptz_left": bytes([0xAA, 0x00, 0x00, 0x00, 0xE8, 0x03, 0xE8, 0x03, 0xE9, 0x03, 0xE8, 0x03, 0x00, 0x00, 0x01, 0x00]),
+    "ptz_up": bytes([0xAA, 0x00, 0x00, 0x00, 0xE8, 0x03, 0xE8, 0x03, 0xE8, 0x03, 0xEB, 0x03, 0x00, 0x00, 0x01, 0x00]),
+    "ptz_down": bytes([0xAA, 0x00, 0x00, 0x00, 0xE8, 0x03, 0xE8, 0x03, 0xE8, 0x03, 0xEC, 0x03, 0x00, 0x00, 0x01, 0x00]),
+    "ptz_stop": bytes([0xAA, 0x00, 0x00, 0x00, 0xE8, 0x03, 0xE8, 0x03, 0xE8, 0x03, 0xE8, 0x03, 0x00, 0x00, 0x01, 0x00]),
+    # 1005 / 1006 on the unused PTZ channel (same 0xAA packet as pan/tilt)
+    "ptz_zoom_in": bytes([0xAA, 0x00, 0x00, 0x00, 0xED, 0x03, 0xE8, 0x03, 0xE8, 0x03, 0xE8, 0x03, 0x00, 0x00, 0x01, 0x00]),
+    "ptz_zoom_out": bytes([0xAA, 0x00, 0x00, 0x00, 0xEE, 0x03, 0xE8, 0x03, 0xE8, 0x03, 0xE8, 0x03, 0x00, 0x00, 0x01, 0x00]),
+    # PTZ self-check / coordinate calibration (V380 app: More → PTZ calibration).
+    # 0xEF (1007) follows the same channel layout as zoom 1005/1006.
+    "ptz_calibrate": bytes([0xAA, 0x00, 0x00, 0x00, 0xEF, 0x03, 0xE8, 0x03, 0xE8, 0x03, 0xE8, 0x03, 0x00, 0x00, 0x01, 0x00]),
+    # Alternate opcode family next to image_flip (0xBE).
+    "ptz_calibrate_alt": bytes([0xBD, 0x00, 0x00, 0x00, 0xE9, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
+    "light_on": bytes([0xC4, 0x00, 0x00, 0x00, 0xE9, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
+    "light_off": bytes([0xC4, 0x00, 0x00, 0x00, 0xEA, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
+    "light_auto": bytes([0xC4, 0x00, 0x00, 0x00, 0xEB, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
+    "image_color": bytes([0xC5, 0x00, 0x00, 0x00, 0xE9, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
+    "image_bw": bytes([0xC5, 0x00, 0x00, 0x00, 0xEA, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
+    "image_auto": bytes([0xC5, 0x00, 0x00, 0x00, 0xEB, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
+    "image_flip": bytes([0xBE, 0x00, 0x00, 0x00, 0xE8, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
+    "alert_on": bytes([0xC6, 0x00, 0x00, 0x00, 0xE9, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
+    "alert_off": bytes([0xC6, 0x00, 0x00, 0x00, 0xEA, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
+    "alert2_on": bytes([0xC7, 0x00, 0x00, 0x00, 0xE9, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
+    "alert2_off": bytes([0xC7, 0x00, 0x00, 0x00, 0xEA, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
+}
+
+
+def _u32(v: int) -> bytes:
+    return struct.pack("<I", v & 0xFFFFFFFF)
+
+
+def ptz_preset_set_packet(slot: int) -> bytes:
+    """Best-effort Macrovideo-style preset SET (slot 1–6)."""
+    n = max(1, min(6, int(slot)))
+    return bytes([0xAA, 0x00, 0x00, 0x00, 0xE8, 0x03, 0xE8, 0x03, 0xE8, 0x03, 0xE8, 0x03, n & 0xFF, 0x00, 0x02, 0x00])
+
+
+def ptz_preset_call_packet(slot: int) -> bytes:
+    """Best-effort Macrovideo-style preset CALL (slot 1–6)."""
+    n = max(1, min(6, int(slot)))
+    return bytes([0xAA, 0x00, 0x00, 0x00, 0xE8, 0x03, 0xE8, 0x03, 0xE8, 0x03, 0xE8, 0x03, n & 0xFF, 0x00, 0x03, 0x00])
+
+
+def _u16(v: int) -> bytes:
+    return struct.pack("<H", v & 0xFFFF)
+
+
+def _u64(v: int) -> bytes:
+    return struct.pack("<Q", v & 0xFFFFFFFFFFFFFFFF)
+
+
+def _ru32(buf: bytes, off: int) -> int:
+    return struct.unpack_from("<I", buf, off)[0]
+
+
+def _ru16(buf: bytes, off: int) -> int:
+    return struct.unpack_from("<H", buf, off)[0]
+
+
+def encrypt_password(password: str) -> bytes:
+    rng = random.Random()
+    chars = string.ascii_letters + string.digits
+    random_key = bytes(ord(chars[rng.randrange(len(chars))]) for _ in range(16))
+    pad = password.encode("ascii", errors="ignore")[:48].ljust(48, b"\x00")
+
+    def aes_ecb(key: bytes, data: bytearray) -> None:
+        cipher = AES.new(key, AES.MODE_ECB)
+        for i in range(0, 48, 16):
+            data[i : i + 16] = cipher.encrypt(bytes(data[i : i + 16]))
+
+    buf = bytearray(pad)
+    aes_ecb(STATIC_PW_KEY, buf)
+    aes_ecb(random_key, buf)
+    return random_key + bytes(buf)
+
+
+def media_aes_key(ticket: int) -> bytes:
+    return _u32(ticket) + _u64(MEDIA_KEY_MID) + _u32(MEDIA_KEY_TAIL)
+
+
+def decrypt_video(data: bytearray, key: bytes) -> None:
+    cipher = AES.new(key, AES.MODE_ECB)
+    offset = 0
+    length = len(data)
+    while offset + 64 <= length:
+        for i in range(4):
+            o = offset + i * 16
+            data[o : o + 16] = cipher.decrypt(bytes(data[o : o + 16]))
+        offset += 80
+
+
+def decrypt_audio(data: bytearray, key: bytes) -> None:
+    aligned = (len(data) // 16) * 16
+    if aligned == 0:
+        return
+    cipher = AES.new(key, AES.MODE_ECB)
+    for i in range(0, aligned, 16):
+        data[i : i + 16] = cipher.decrypt(bytes(data[i : i + 16]))
+
+
+def encrypt_audio(data: bytearray, key: bytes) -> None:
+    aligned = (len(data) // 16) * 16
+    if aligned == 0:
+        return
+    cipher = AES.new(key, AES.MODE_ECB)
+    for i in range(0, aligned, 16):
+        data[i : i + 16] = cipher.encrypt(bytes(data[i : i + 16]))
+
+
+def _prepare_ima_audio(
+    raw_full: bytes,
+    body: bytearray,
+    key: bytes,
+    need_decrypt: bool,
+    comm_version: int,
+) -> bytearray:
+    """0x16 is IMA ADPCM 8 kHz. v32 encrypts the 256-byte block with the media key."""
+    if not need_decrypt:
+        return bytearray(raw_full[16:] if len(raw_full) > 16 else body)
+    if comm_version == 21:
+        decrypt_pre2k(body, key)
+    else:
+        decrypt_audio(body, key)
+    return body
+
+
+def decrypt_pre2k(data: bytearray, key: bytes) -> None:
+    n = (len(data) // 16) * 16
+    if n <= 0:
+        return
+    cipher = AES.new(key, AES.MODE_ECB)
+    data[:n] = cipher.decrypt(bytes(data[:n]))
+
+
+VIDEO_I = (0x00, 0x28)
+VIDEO_P = (0x01, 0x29)
+VIDEO_TYPES = VIDEO_I + VIDEO_P
+HEVC_TYPES = (0x28, 0x29)
+# 0x1A = G.711 A-law (v31). 0x16 = IMA ADPCM 8 kHz (v32 / original v380). 0x5B = ignore.
+AUDIO_ALAW = 0x1A
+AUDIO_IMA = 0x16
+AUDIO_TYPES = (AUDIO_ALAW, AUDIO_IMA)
+SKIP_TYPES = (0x5B,)
+FRAG_OK = VIDEO_TYPES + AUDIO_TYPES + SKIP_TYPES
+
+
+def _header_sizes_ok(pay_len: int, total: int, cur: int) -> bool:
+    return pay_len > 0 and pay_len <= 20000 and total > 0 and cur < total
+
+
+def has_annexb_start(body: bytes) -> bool:
+    if len(body) >= 4 and body[:4] == b"\x00\x00\x00\x01":
+        return True
+    return len(body) >= 3 and body[:3] == b"\x00\x00\x01"
+
+
+def find_nals(data: bytes) -> list[bytes]:
+    nals: list[bytes] = []
+    i = 0
+    while i < len(data) - 4:
+        if data[i : i + 4] == b"\x00\x00\x00\x01":
+            start = i + 4
+            end = start
+            while end < len(data) - 4:
+                if data[end : end + 4] == b"\x00\x00\x00\x01":
+                    break
+                end += 1
+            if end >= len(data) - 4:
+                end = len(data)
+            nals.append(data[start:end])
+            i = end
+        else:
+            i += 1
+    return nals
+
+
+def extract_sps_pps(h264: bytes) -> tuple[bytes | None, bytes | None]:
+    sps = pps = None
+    for nal in find_nals(h264):
+        if not nal:
+            continue
+        t = nal[0] & 0x1F
+        if t == 7:
+            sps = nal
+        elif t == 8:
+            pps = nal
+    return sps, pps
+
+
+def extract_hevc_params(annexb: bytes) -> tuple[bytes | None, bytes | None, bytes | None]:
+    vps = sps = pps = None
+    for nal in find_nals(annexb):
+        if not nal:
+            continue
+        t = (nal[0] >> 1) & 0x3F
+        if t == 32:
+            vps = nal
+        elif t == 33:
+            sps = nal
+        elif t == 34:
+            pps = nal
+    return vps, sps, pps
+
+
+def prepend_sps_pps(idr: bytes, sps: bytes, pps: bytes) -> bytes:
+    sc = b"\x00\x00\x00\x01"
+    return sc + sps + sc + pps + idr
+
+
+def prepend_hevc_params(idr: bytes, vps: bytes, sps: bytes, pps: bytes) -> bytes:
+    sc = b"\x00\x00\x00\x01"
+    return sc + vps + sc + sps + sc + pps + idr
+
+
+def looks_like_hevc(annexb: bytes) -> bool:
+    for nal in find_nals(annexb):
+        if not nal:
+            continue
+        t = (nal[0] >> 1) & 0x3F
+        if t in (32, 33, 34, 19, 20, 21):
+            return True
+        break
+    return False
+
+
+def has_hevc_vps(annexb: bytes) -> bool:
+    for nal in find_nals(annexb):
+        if nal and ((nal[0] >> 1) & 0x3F) == 32:
+            return True
+    return False
+
+
+def recv_exact(sock: socket.socket, n: int, timeout: float = 8.0) -> bytes:
+    sock.settimeout(timeout)
+    chunks = bytearray()
+    while len(chunks) < n:
+        part = sock.recv(n - len(chunks))
+        if not part:
+            break
+        chunks.extend(part)
+    return bytes(chunks)
+
+
+class RecvBuf:
+    def __init__(self, sock: socket.socket):
+        self.sock = sock
+        self.buf = bytearray()
+        self.closed = False
+
+    def feed(self, data: bytes) -> None:
+        self.buf.extend(data)
+
+    def pull(self, n: int, timeout: float) -> bytes:
+        deadline = time.time() + timeout
+        while len(self.buf) < n and not self.closed:
+            remain = deadline - time.time()
+            if remain <= 0:
+                break
+            self.sock.settimeout(min(1.0, remain))
+            try:
+                part = self.sock.recv(min(65536, max(n - len(self.buf), 8192)))
+            except (TimeoutError, socket.timeout):
+                continue
+            if not part:
+                self.closed = True
+                break
+            self.buf.extend(part)
+        if len(self.buf) < n:
+            return b""
+        out = bytes(self.buf[:n])
+        del self.buf[:n]
+        return out
+
+    def find_sync(self, timeout: float, stop_event=None) -> bool:
+        deadline = time.time() + timeout
+        while not self.closed:
+            if stop_event is not None and stop_event.is_set():
+                return False
+            idx = self.buf.find(b"\x7f")
+            if idx >= 0:
+                if idx > 0:
+                    del self.buf[:idx]
+                return True
+            remain = deadline - time.time()
+            if remain <= 0:
+                return False
+            self.sock.settimeout(min(1.0, remain))
+            try:
+                part = self.sock.recv(16384)
+            except (TimeoutError, socket.timeout):
+                continue
+            if not part:
+                self.closed = True
+                return False
+            self.buf.extend(part)
+        return False
+
+
+class V380SnapshotClient:
+    def __init__(
+        self,
+        ip: str,
+        device_id: int,
+        username: str,
+        password: str,
+        port: int = 8800,
+        quality: int = 1,
+        source: str = "lan",
+    ):
+        self.ip = ip
+        self.port = port
+        self.device_id = device_id & 0xFFFFFFFF
+        self.username = username
+        self.password = password
+        self.quality = 1 if quality else 0
+        self.source = source if source in ("lan", "cloud") else "lan"
+        self.audio_enable = 4097
+        self.auth_ticket = 0
+        self.session_id = 0
+        self.device_version = 0
+        self.comm_version = 0
+        self.frame_width = 1280
+        self.frame_height = 720
+        self.aes_key = b"\x00" * 16
+        self._sock: socket.socket | None = None
+        self._rx: RecvBuf | None = None
+        self._vps: bytes | None = None
+        self._sps: bytes | None = None
+        self._pps: bytes | None = None
+        self.video_codec = "h264"
+        self.audio_codec = "alaw"
+        self.audio_hz = 8
+        self.audio_bits = 16
+        self.audio_ch = 1
+        self._stream_info = b""
+        self.frame_stats: dict[int, int] = {}
+        self._send_lock = threading.Lock()
+        self._talk_seq = 0
+        self._talk_on = False
+        self._talk_sock: socket.socket | None = None
+
+    def close(self) -> None:
+        self.stop_talk()
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+            self._sock = None
+        self._rx = None
+
+    def connect(self) -> None:
+        self._auth()
+        self._stream_login()
+        self._start_stream()
+
+    def _tcp(self) -> socket.socket:
+        s = socket.create_connection((self.ip, self.port), timeout=5)
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        return s
+
+    def _auth(self) -> None:
+        sock = self._tcp()
+        try:
+            pkt = bytearray(520)
+            pkt[0:4] = _u32(1167)
+            pkt[8] = 31
+            pkt[9:13] = _u32(1)
+            pkt[13:17] = _u32(self.device_id)
+            user = self.username.encode("ascii", errors="ignore")[:32]
+            pw = encrypt_password(self.password)
+            if self.source == "cloud":
+                pkt[4:8] = _u32(1022)
+                host = f"{self.device_id}.nvdvr.net".encode("ascii")[:50]
+                pkt[17 : 17 + len(host)] = host
+                pkt[67:71] = _u32(self.port)
+                pkt[71 : 71 + len(user)] = user
+                pkt[103 : 103 + len(pw)] = pw
+            else:
+                pkt[4:8] = _u32(120)
+                pkt[49 : 49 + len(user)] = user
+                pkt[81 : 81 + len(pw)] = pw
+            sock.sendall(pkt)
+            resp = recv_exact(sock, 256, timeout=8)
+            if len(resp) < 16:
+                raise RuntimeError("Auth response too short")
+            if _ru32(resp, 0) != 1168:
+                raise RuntimeError(f"Unexpected auth cmd {_ru32(resp, 0)}")
+            result = _ru32(resp, 4)
+            if result != 1001:
+                reasons = {1011: "invalid username", 1012: "invalid password", 1018: "invalid device id"}
+                raise RuntimeError(reasons.get(result, f"login failed ({result})"))
+            self.device_version = resp[12]
+            self.auth_ticket = _ru32(resp, 13)
+            self.session_id = _ru32(resp, 17)
+        finally:
+            sock.close()
+
+    def _stream_login(self) -> None:
+        sock = self._tcp()
+        pkt = bytearray(256)
+        pkt[0:4] = _u32(301)
+        if self.source == "cloud":
+            pkt[4:8] = _u32(1022)
+            host = f"{self.device_id}.nvdvr.net".encode("ascii")[:50]
+            pkt[8 : 8 + len(host)] = host
+            pkt[58:62] = _u32(self.port)
+            pkt[62:66] = _u32(self.device_id)
+            pkt[66:70] = _u32(self.auth_ticket)
+            pkt[70:74] = _u32(self.session_id)
+            pkt[74:78] = _u32(self.quality)
+            pkt[78] = 20
+            pkt[79:83] = _u32(1)
+        else:
+            pkt[4:8] = _u32(self.device_id)
+            pkt[8:12] = _u32(0)
+            pkt[12:14] = _u16(20)
+            pkt[14:18] = _u32(self.auth_ticket)
+            pkt[22:26] = _u32(self.audio_enable)
+            pkt[26:30] = _u32(self.quality)
+        sock.sendall(pkt)
+
+        rx = RecvBuf(sock)
+        # Camera sends a short 401 (32 bytes on this firmware), not 412.
+        head = rx.pull(8, timeout=8)
+        if len(head) < 8:
+            sock.close()
+            raise RuntimeError("Stream login response too short")
+        if _ru32(head, 0) != 401:
+            sock.close()
+            raise RuntimeError(f"Unexpected stream cmd {_ru32(head, 0)}")
+        result = struct.unpack_from("<i", head, 4)[0]
+        if result in (-11, -12):
+            sock.close()
+            raise RuntimeError(f"Stream login rejected ({result})")
+
+        rest = rx.pull(24, timeout=1.0)
+        info = head + rest
+        self._stream_info = bytes(info)
+        if len(info) >= 18:
+            self.comm_version = _ru16(info, 8)
+            self.frame_width = _ru32(info, 10) or 1280
+            self.frame_height = _ru32(info, 14) or 720
+        if len(info) >= 25:
+            self.audio_hz = info[22]
+            self.audio_bits = info[23]
+            self.audio_ch = info[24]
+        if self.device_version > 30:
+            self.aes_key = media_aes_key(self.auth_ticket)
+        self._sock = sock
+        self._rx = rx
+
+    def _start_stream(self) -> None:
+        if self._sock is None:
+            raise RuntimeError("Not connected")
+        pkt = bytearray(256)
+        pkt[0:4] = _u32(303)
+        pkt[4:6] = _u16(0x3001)
+        self._sock.sendall(pkt)
+
+    def send_control(self, name: str) -> bool:
+        pkt = COMMANDS.get(name)
+        if pkt is None or self._sock is None:
+            return False
+        try:
+            with self._send_lock:
+                self._sock.sendall(pkt)
+            return True
+        except OSError:
+            return False
+
+    def send_raw(self, pkt: bytes) -> bool:
+        if not pkt or self._sock is None:
+            return False
+        try:
+            with self._send_lock:
+                self._sock.sendall(pkt)
+            return True
+        except OSError:
+            return False
+
+    def preset_set(self, slot: int) -> bool:
+        ok = self.send_raw(ptz_preset_set_packet(slot))
+        # Alternate action byte used by some firmwares.
+        alt = bytearray(ptz_preset_set_packet(slot))
+        alt[14] = 0x04
+        self.send_raw(bytes(alt))
+        return ok
+
+    def preset_call(self, slot: int) -> bool:
+        ok = self.send_raw(ptz_preset_call_packet(slot))
+        alt = bytearray(ptz_preset_call_packet(slot))
+        alt[14] = 0x05
+        self.send_raw(bytes(alt))
+        time.sleep(0.2)
+        return ok
+
+    def calibrate_ptz(self) -> bool:
+        """Trigger firmware self-check, then a full-speed motor sweep."""
+        if self._sock is None:
+            return False
+        ok = False
+        for name in ("ptz_calibrate", "ptz_calibrate_alt"):
+            try:
+                if self.send_control(name):
+                    ok = True
+            except Exception:
+                pass
+        # Let firmware run its own sweep if it supports the opcode.
+        time.sleep(12.0)
+        steps = (
+            ("ptz_left", 8.0),
+            ("ptz_right", 16.0),
+            ("ptz_left", 8.0),
+            ("ptz_up", 5.0),
+            ("ptz_down", 10.0),
+            ("ptz_up", 5.0),
+        )
+        for cmd, secs in steps:
+            if self.send_control(cmd):
+                ok = True
+                time.sleep(secs)
+            self.send_control("ptz_stop")
+            time.sleep(0.15)
+        self.send_control("ptz_stop")
+        return ok
+
+    def start_talk(self) -> bool:
+        """Open a second TCP socket and send the V380 speak handshake (cmd 0x179)."""
+        self.stop_talk()
+        if not self.auth_ticket:
+            return False
+        try:
+            sock = socket.create_connection((self.ip, self.port), timeout=5)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            hs = bytearray(85)
+            hs[0:4] = _u32(0x179)
+            hs[4:8] = _u32(self.device_id)
+            hs[8:12] = _u32(self.auth_ticket)
+            sock.sendall(hs)
+        except OSError:
+            return False
+        self._talk_sock = sock
+        self._talk_on = True
+        self._talk_seq = 0
+        threading.Thread(target=self._talk_drain, daemon=True, name="v380-talk").start()
+        time.sleep(0.3)
+        return True
+
+    def _talk_drain(self) -> None:
+        sock = self._talk_sock
+        while self._talk_on and sock is not None:
+            try:
+                chunk = sock.recv(1024)
+            except OSError:
+                break
+            if not chunk:
+                break
+
+    def stop_talk(self) -> bool:
+        self._talk_on = False
+        sock = self._talk_sock
+        self._talk_sock = None
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        return True
+
+    def send_talk_audio(self, ima256: bytes) -> bool:
+        """Send one 256-byte IMA-ADPCM speak frame on the talk socket."""
+        sock = self._talk_sock
+        if not ima256 or sock is None or not self._talk_on:
+            return False
+        body = bytearray(ima256[:256])
+        if len(body) < 256:
+            body.extend(b"\x00" * (256 - len(body)))
+        if self.device_version > 30:
+            encrypt_audio(body, self.aes_key)
+        self._talk_seq += 1
+        header = bytearray.fromhex("b40000000100160000000000000001")
+        header.append(self._talk_seq & 0xFF)
+        try:
+            sock.sendall(bytes(header) + bytes(body))
+            return True
+        except OSError:
+            self._talk_on = False
+            return False
+
+    def read_iframe(self, timeout: float = 15.0) -> bytes:
+        if self._sock is None or self._rx is None:
+            raise RuntimeError("Not connected")
+        need_decrypt = self.device_version > 30
+        video = bytearray()
+        video_total = 0
+        deadline = time.time() + timeout
+
+        while time.time() < deadline:
+            remain = max(1.0, deadline - time.time())
+            if not self._rx.find_sync(remain):
+                raise RuntimeError("No video header (0x7F) from camera")
+            header = self._rx.pull(12, timeout=3)
+            if len(header) < 12:
+                raise RuntimeError("Stream ended")
+            if header[0] != 0x7F:
+                continue
+            ftype = header[1]
+            total = _ru16(header, 3)
+            cur = _ru16(header, 5)
+            pay_len = _ru16(header, 7)
+            if not _header_sizes_ok(pay_len, total, cur):
+                # false 0x7F in payload — drop one byte and resync
+                self._rx.feed(header[1:])
+                continue
+            payload = self._rx.pull(pay_len, timeout=8)
+            if len(payload) < pay_len:
+                self._rx.feed(header[1:] + payload)
+                continue
+            self.frame_stats[ftype] = self.frame_stats.get(ftype, 0) + 1
+            if ftype in SKIP_TYPES or ftype not in VIDEO_TYPES:
+                continue
+            if cur == 0 or total != video_total:
+                video = bytearray()
+                video_total = total
+            video.extend(payload)
+            if cur != total - 1:
+                continue
+            if len(video) < 16:
+                video = bytearray()
+                continue
+            body = bytearray(video[16:])
+            video = bytearray()
+            if need_decrypt:
+                if self.comm_version == 21:
+                    decrypt_pre2k(body, self.aes_key)
+                else:
+                    decrypt_video(body, self.aes_key)
+            if not has_annexb_start(body):
+                continue
+            if ftype not in VIDEO_I:
+                continue
+            self._note_codec(ftype)
+            self._cache_params(ftype, bytes(body))
+            return bytes(body)
+
+        raise RuntimeError("Timed out waiting for I-frame")
+
+    def iter_video_frames(self, stop_event=None):
+        """Yield decrypted Annex-B video frames (I and P) in order."""
+        if self._sock is None or self._rx is None:
+            raise RuntimeError("Not connected")
+        need_decrypt = self.device_version > 30
+        video = bytearray()
+        audio = bytearray()
+        video_total = 0
+        audio_total = 0
+        last_type = 0
+        last_audio = 0
+
+        while stop_event is None or not stop_event.is_set():
+            if not self._rx.find_sync(20.0, stop_event):
+                if stop_event is not None and stop_event.is_set():
+                    return
+                if self._rx.closed:
+                    raise RuntimeError("Stream ended")
+                continue
+            header = self._rx.pull(12, timeout=3)
+            if len(header) < 12:
+                if self._rx.closed:
+                    raise RuntimeError("Stream ended")
+                continue
+            if header[0] != 0x7F:
+                continue
+            ftype = header[1]
+            total = _ru16(header, 3)
+            cur = _ru16(header, 5)
+            pay_len = _ru16(header, 7)
+            if not _header_sizes_ok(pay_len, total, cur):
+                self._rx.feed(header[1:])
+                continue
+            payload = self._rx.pull(pay_len, timeout=8)
+            if len(payload) < pay_len:
+                self._rx.feed(header[1:] + payload)
+                continue
+            self.frame_stats[ftype] = self.frame_stats.get(ftype, 0) + 1
+            if ftype in SKIP_TYPES:
+                continue
+            if ftype in AUDIO_TYPES:
+                if cur == 0 or total != audio_total:
+                    audio = bytearray()
+                    audio_total = total
+                    last_audio = ftype
+                audio.extend(payload)
+                if cur != total - 1:
+                    continue
+                if len(audio) < 16:
+                    audio = bytearray()
+                    continue
+                raw_full = bytes(audio)
+                body = bytearray(audio[16:])
+                audio = bytearray()
+                if last_audio == AUDIO_IMA:
+                    self.audio_codec = "ima"
+                    body = _prepare_ima_audio(raw_full, body, self.aes_key, need_decrypt, self.comm_version)
+                else:
+                    self.audio_codec = "alaw"
+                    if need_decrypt:
+                        if self.comm_version == 21:
+                            decrypt_pre2k(body, self.aes_key)
+                        else:
+                            decrypt_audio(body, self.aes_key)
+                yield "audio", False, bytes(body)
+                continue
+            if ftype not in VIDEO_TYPES:
+                continue
+            if cur == 0 or total != video_total:
+                video = bytearray()
+                video_total = total
+                last_type = ftype
+            video.extend(payload)
+            if cur != total - 1:
+                continue
+            if len(video) < 16:
+                video = bytearray()
+                continue
+            body = bytearray(video[16:])
+            video = bytearray()
+            if need_decrypt:
+                if self.comm_version == 21:
+                    decrypt_pre2k(body, self.aes_key)
+                else:
+                    decrypt_video(body, self.aes_key)
+            if not has_annexb_start(body):
+                continue
+            self._note_codec(last_type)
+            if last_type in VIDEO_I:
+                self._cache_params(last_type, bytes(body))
+            yield "video", last_type in VIDEO_I, bytes(body)
+
+    def _note_codec(self, ftype: int) -> None:
+        if ftype in HEVC_TYPES:
+            self.video_codec = "hevc"
+
+    def _cache_params(self, ftype: int, body: bytes) -> None:
+        if ftype in HEVC_TYPES:
+            vps, sps, pps = extract_hevc_params(body)
+            if vps:
+                self._vps = vps
+            if sps:
+                self._sps = sps
+            if pps:
+                self._pps = pps
+            return
+        sps, pps = extract_sps_pps(body)
+        if sps:
+            self._sps = sps
+        if pps:
+            self._pps = pps
+
+    def h264_for_decode(self, iframe: bytes) -> bytes:
+        if self.video_codec == "hevc":
+            if self._vps and self._sps and self._pps and not has_hevc_vps(iframe):
+                return prepend_hevc_params(iframe, self._vps, self._sps, self._pps)
+            return iframe
+        if self._sps and self._pps:
+            return prepend_sps_pps(iframe, self._sps, self._pps)
+        return iframe
+
+
+def _win_hide_kwargs() -> dict:
+    """Stop ffmpeg from flashing a console on Windows."""
+    if sys.platform != "win32":
+        return {}
+    kw: dict = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)}
+    try:
+        info = subprocess.STARTUPINFO()
+        info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        info.wShowWindow = 0
+        kw["startupinfo"] = info
+    except Exception:
+        pass
+    return kw
+
+
+def _ffmpeg_exe() -> str | None:
+    from shutil import which
+
+    found = which("ffmpeg")
+    if found:
+        return found
+    try:
+        import imageio_ffmpeg
+
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+
+class LiveH264Decoder:
+    """Persistent FFmpeg pipe: Annex-B in, JPEG out, every frame."""
+
+    def __init__(
+        self,
+        out_queue,
+        fmt: str = "h264",
+        *,
+        scale_width: int = 0,
+        jpeg_q: int = 6,
+        threads: int | None = None,
+    ):
+        import threading
+
+        exe = _ffmpeg_exe()
+        if not exe:
+            raise RuntimeError("FFmpeg not available")
+        self.fmt = "hevc" if fmt == "hevc" else "h264"
+        # HEVC needs a bit more probe buffer or the first frames go gray.
+        probe = "524288" if self.fmt == "hevc" else "65536"
+        analyze = "500000" if self.fmt == "hevc" else "0"
+        cmd = [
+            exe,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-fflags",
+            "nobuffer+genpts+discardcorrupt",
+            "-flags",
+            "low_delay",
+            "-probesize",
+            probe,
+            "-analyzeduration",
+            analyze,
+            "-vsync",
+            "0",
+            "-threads",
+            str(threads if threads is not None else (2 if self.fmt == "hevc" else 1)),
+        ]
+        cmd.extend(["-f", self.fmt, "-i", "pipe:0"])
+        if scale_width > 0:
+            cmd.extend(["-vf", f"scale={scale_width}:-2"])
+        # Lower -q:v = sharper JPEG (smoother look on screen)
+        q = max(2, min(8, int(jpeg_q)))
+        cmd.extend(["-f", "image2pipe", "-vcodec", "mjpeg", "-q:v", str(q), "pipe:1"])
+        popen_kw: dict = {
+            "stdin": subprocess.PIPE,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.DEVNULL,
+            "bufsize": 0,
+        }
+        popen_kw.update(_win_hide_kwargs())
+        self.proc = subprocess.Popen(cmd, **popen_kw)
+        self._queue = out_queue
+        self._stop = threading.Event()
+        self._in_q: queue.Queue = queue.Queue(maxsize=3)
+        self._reader = threading.Thread(target=self._read_loop, daemon=True)
+        self._writer = threading.Thread(target=self._write_loop, daemon=True)
+        self._reader.start()
+        self._writer.start()
+
+    def write_frame(
+        self,
+        is_iframe: bool,
+        payload: bytes,
+        sps: bytes | None,
+        pps: bytes | None,
+        vps: bytes | None = None,
+    ) -> None:
+        item = (is_iframe, payload, sps, pps, vps)
+        if is_iframe:
+            # Never drop a keyframe — that causes the gray ghost picture.
+            while True:
+                try:
+                    self._in_q.get_nowait()
+                except queue.Empty:
+                    break
+            try:
+                self._in_q.put_nowait(item)
+            except queue.Full:
+                pass
+            return
+        try:
+            self._in_q.put_nowait(item)
+        except queue.Full:
+            # Keep GOP intact — dropping a queued NALu mid-stream causes gray gaps.
+            pass
+
+    def _write_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                is_iframe, payload, sps, pps, vps = self._in_q.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            if self.proc.stdin is None:
+                break
+            chunk = payload
+            if is_iframe and self.fmt == "hevc" and vps and sps and pps and not has_hevc_vps(payload):
+                chunk = prepend_hevc_params(payload, vps, sps, pps)
+            elif is_iframe and self.fmt != "hevc" and sps and pps:
+                chunk = prepend_sps_pps(payload, sps, pps)
+            try:
+                self.proc.stdin.write(chunk)
+                self.proc.stdin.flush()
+            except (BrokenPipeError, OSError, ValueError):
+                break
+
+    def _read_loop(self) -> None:
+        stdout = self.proc.stdout
+        if stdout is None:
+            return
+        buf = bytearray()
+        while not self._stop.is_set():
+            chunk = stdout.read(8192)
+            if not chunk:
+                break
+            buf.extend(chunk)
+            while True:
+                jpeg = _pop_jpeg(buf)
+                if not jpeg:
+                    break
+                if self._queue.full():
+                    try:
+                        self._queue.get_nowait()
+                    except Exception:
+                        pass
+                try:
+                    self._queue.put_nowait(jpeg)
+                except Exception:
+                    pass
+
+    def close(self) -> None:
+        self._stop.set()
+        try:
+            if self.proc.stdin:
+                self.proc.stdin.close()
+        except OSError:
+            pass
+        try:
+            self.proc.kill()
+        except OSError:
+            pass
+
+
+class PyAVLiveDecoder:
+    """In-process HEVC/H264 decode via PyAV — much lower latency than an FFmpeg JPEG pipe."""
+
+    def __init__(
+        self,
+        out_queue,
+        fmt: str = "h264",
+        *,
+        scale_width: int = 0,
+        jpeg_q: int = 3,
+        threads: int | None = None,
+        output: str = "rgb",
+    ):
+        import av
+
+        self._av = av
+        self._queue = out_queue
+        self.fmt = "hevc" if fmt == "hevc" else "h264"
+        self.scale_width = int(scale_width or 0)
+        # Map ffmpeg-style q (2=best) to OpenCV JPEG quality.
+        self.jpeg_q = int(max(55, min(92, 100 - max(2, jpeg_q) * 6)))
+        self.output = "jpeg" if str(output).lower() == "jpeg" else "rgb"
+        self._threads = threads
+        self._stop = threading.Event()
+        # Small buffer so HEVC keeps reference frames; UI still shows only the newest picture.
+        self._in_q: queue.Queue = queue.Queue(maxsize=3)
+        self._codec = self._new_codec()
+        self._writer = threading.Thread(target=self._run, daemon=True, name="pyav-dec")
+        self._writer.start()
+
+    def _new_codec(self):
+        codec = self._av.CodecContext.create(self.fmt, "r")
+        # Multi-thread decode keeps up with the camera (single-thread builds lag).
+        try:
+            n = 0 if self._threads is None else int(self._threads)
+            codec.thread_type = "AUTO"
+            codec.thread_count = n
+        except Exception:
+            pass
+        try:
+            codec.options = {"flags": "+low_delay"}
+        except Exception:
+            pass
+        return codec
+
+    def write_frame(
+        self,
+        is_iframe: bool,
+        payload: bytes,
+        sps: bytes | None,
+        pps: bytes | None,
+        vps: bytes | None = None,
+    ) -> None:
+        item = (is_iframe, payload, sps, pps, vps)
+        if is_iframe:
+            # Resync on keyframe — safe to drop stale P-frames here.
+            while True:
+                try:
+                    self._in_q.get_nowait()
+                except queue.Empty:
+                    break
+            try:
+                self._in_q.put_nowait(item)
+            except queue.Full:
+                pass
+            return
+        try:
+            self._in_q.put_nowait(item)
+        except queue.Full:
+            # Do NOT steal a queued frame mid-GOP — that causes gray gaps. Drop this late P-frame.
+            pass
+
+    def _run(self) -> None:
+        import cv2
+        import numpy as np
+
+        while not self._stop.is_set():
+            try:
+                is_iframe, payload, sps, pps, vps = self._in_q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            chunk = payload
+            if is_iframe and self.fmt == "hevc" and vps and sps and pps and not has_hevc_vps(payload):
+                chunk = prepend_hevc_params(payload, vps, sps, pps)
+            elif is_iframe and self.fmt != "hevc" and sps and pps:
+                chunk = prepend_sps_pps(payload, sps, pps)
+            try:
+                packet = self._av.Packet(chunk)
+                frames = self._codec.decode(packet)
+            except Exception:
+                if is_iframe:
+                    try:
+                        self._codec = self._new_codec()
+                        packet = self._av.Packet(chunk)
+                        frames = self._codec.decode(packet)
+                    except Exception:
+                        continue
+                else:
+                    continue
+            for frame in frames:
+                try:
+                    arr = frame.to_ndarray(format="bgr24")
+                except Exception:
+                    continue
+                if self.scale_width > 0 and arr.shape[1] > self.scale_width:
+                    h = max(1, int(arr.shape[0] * (self.scale_width / arr.shape[1])))
+                    arr = cv2.resize(arr, (self.scale_width, h), interpolation=cv2.INTER_AREA)
+                if self.output == "jpeg":
+                    ok, enc = cv2.imencode(".jpg", arr, [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_q])
+                    if not ok:
+                        continue
+                    item = enc.tobytes()
+                else:
+                    # RGB ndarray — skip JPEG encode/decode (sharper + lower lag).
+                    item = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
+                if self._queue.full():
+                    try:
+                        self._queue.get_nowait()
+                    except Exception:
+                        pass
+                try:
+                    self._queue.put_nowait(item)
+                except Exception:
+                    pass
+
+    def close(self) -> None:
+        self._stop.set()
+        try:
+            while True:
+                self._in_q.get_nowait()
+        except queue.Empty:
+            pass
+
+
+def make_live_decoder(out_queue, fmt: str = "h264", **kwargs):
+    """Prefer PyAV (low latency). Fall back to FFmpeg JPEG pipe."""
+    try:
+        import av  # noqa: F401
+
+        return PyAVLiveDecoder(out_queue, fmt=fmt, **kwargs)
+    except Exception:
+        return LiveH264Decoder(out_queue, fmt=fmt, **kwargs)
+
+
+def _pop_jpeg(buf: bytearray) -> bytes | None:
+    start = buf.find(b"\xff\xd8")
+    if start < 0:
+        if len(buf) > 1_000_000:
+            buf.clear()
+        return None
+    if start > 0:
+        del buf[:start]
+    end = buf.find(b"\xff\xd9", 2)
+    if end < 0:
+        return None
+    jpeg = bytes(buf[: end + 2])
+    del buf[: end + 2]
+    return jpeg if len(jpeg) > 500 else None
+
+
+def h264_to_jpeg(h264: bytes) -> bytes:
+    fmt = "hevc" if looks_like_hevc(h264) else "h264"
+    jpeg = _decode_opencv(h264)
+    if jpeg:
+        return jpeg
+    jpeg = _decode_ffmpeg(h264, fmt)
+    if jpeg:
+        return jpeg
+    raise RuntimeError("Could not decode video (install opencv-python or ffmpeg)")
+
+
+def _decode_opencv(h264: bytes) -> bytes | None:
+    try:
+        import cv2
+    except ImportError:
+        return None
+    tmp = Path(tempfile.gettempdir()) / "v380_snap.h264"
+    tmp.write_bytes(h264)
+    cap = cv2.VideoCapture(str(tmp))
+    try:
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            return None
+        ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+        return buf.tobytes() if ok else None
+    finally:
+        cap.release()
+
+
+def _decode_ffmpeg(h264: bytes, fmt: str = "h264") -> bytes | None:
+    try:
+        run_kw: dict = {
+            "input": h264,
+            "capture_output": True,
+            "timeout": 8,
+            "check": False,
+        }
+        run_kw.update(_win_hide_kwargs())
+        proc = subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                fmt,
+                "-i",
+                "pipe:0",
+                "-frames:v",
+                "1",
+                "-q:v",
+                "2",
+                "-f",
+                "image2",
+                "pipe:1",
+            ],
+            **run_kw,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    return proc.stdout if proc.stdout else None
+
+
+_g = globals()
+for _a, _b in (
+    ("V380SnapshotClient", "V380SnapshotClient"),
+    ("LiveH264Decoder", "LiveH264Decoder"),
+):
+    if _a in _g and _b not in _g:
+        _g[_b] = _g[_a]
+    if _b in _g and _a not in _g:
+        _g[_a] = _g[_b]
+_cls = _g.get("V380SnapshotClient") or _g.get("V380SnapshotClient")
+if _cls is not None:
+    for _a, _b in (
+        ("send_control", "send_control"),
+        ("iter_video_frames", "iter_video_frames"),
+        ("h264_for_decode", "h264_for_decode"),
+        ("start_talk", "start_talk"),
+        ("send_talk_audio", "send_talk_audio"),
+        ("stop_talk", "stop_talk"),
+    ):
+        if hasattr(_cls, _a) and not hasattr(_cls, _b):
+            setattr(_cls, _b, getattr(_cls, _a))
+        if hasattr(_cls, _b) and not hasattr(_cls, _a):
+            setattr(_cls, _a, getattr(_cls, _b))
+_dec = _g.get("LiveH264Decoder") or _g.get("LiveH264Decoder")
+if _dec is not None and hasattr(_dec, "write_frame") and not hasattr(_dec, "write_frame"):
+    _dec.write_frame = _dec.write_frame
+if _dec is not None and hasattr(_dec, "write_frame") and not hasattr(_dec, "write_frame"):
+    _dec.write_frame = _dec.write_frame

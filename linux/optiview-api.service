@@ -1,0 +1,16 @@
+[Unit]
+Description=Optiview recordings API
+After=network.target local-fs.target
+RequiresMountsFor=/mnt/optiview-recordings
+
+[Service]
+Type=simple
+Environment=TZ=Asia/Karachi
+Environment=V380_EXTERNAL_RECORD=1
+WorkingDirectory=/opt/optiview
+ExecStart=/opt/optiview/.venv/bin/python /opt/optiview/clip_server.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,83 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+.Python
+*.egg
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# --- Runtime / local data (do not commit) ---
+data/
+!data/.gitkeep
+
+# Camera recordings & worker output
+recordings/
+audio/
+weights/
+*.mp4
+*.ts
+*.m3u8
+*.hls/
+
+# Snapshots / debug captures
+last_snapshot.jpg
+*.jpg.tmp
+pano_test.jpg
+
+# Secrets & tokens
+*.key
+*.pem
+*.bin
+ezviz_token.json
+ezviz_account.bin
+**/master.key
+
+# Logs / PID / status
+*.log
+*.pid
+backend_status.json
+record_worker.json
+record_worker.json.tmp
+studio.lease
+
+# AI model weights (downloaded on first use)
+*.pt
+*.onnx
+*.engine
+v380/ai/models/*
+!v380/ai/models/.gitkeep
+
+# PyInstaller / packaging
+build/
+dist/
+*.spec.bak
+installer/*.exe
+installer/Output/
+
+# Linux package dumps
+*.tar.gz
+*.zip
+
+# OS / editor
+.DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/
+*.swp
+*~
