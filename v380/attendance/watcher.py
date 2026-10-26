@@ -135,8 +135,11 @@ class AttendanceWatcher:
             try:
                 result = self._tick_once(svc, int(cam_id))
                 # Burst: face seen but not matched (blur / angle) — retry live frames quickly.
+                # Skip burst when the last tick was already slow (model under load).
+                elapsed_pre = time.time() - t0
                 if (
-                    result
+                    elapsed_pre < 1.2
+                    and result
                     and not result.get("matched")
                     and not result.get("error")
                     and int(result.get("faces") or 0) > 0
@@ -158,7 +161,13 @@ class AttendanceWatcher:
                 self._last_error = str(exc)
 
             elapsed = time.time() - t0
-            wait = max(0.05, base_interval - elapsed)
+            # Under heavy InsightFace load, back off so UI enroll/identify stay responsive.
+            if elapsed > 2.0:
+                wait = max(0.8, base_interval)
+            elif elapsed > 1.0:
+                wait = max(0.35, base_interval - elapsed * 0.3)
+            else:
+                wait = max(0.05, base_interval - elapsed)
             self._stop.wait(wait)
         with self._lock:
             self._running = False

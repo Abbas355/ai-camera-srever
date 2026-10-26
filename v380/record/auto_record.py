@@ -1824,9 +1824,8 @@ def _sync_logon_task(enabled: bool) -> None:
     try:
         from v380.windows_autostart import ensure_autostart
 
-        # Always keep backend autostart when any recording is used; also leave
-        # it on so live hub stays available after reboot.
-        ensure_autostart(True)
+        # Respect user preference (UI toggle) — do not force-enable on record.
+        ensure_autostart(None)
         if not enabled:
             # Legacy worker-only tasks are superseded by OptiviewBackend.
             _run_schtasks(["schtasks", "/Delete", "/F", "/TN", TASK_NAME])

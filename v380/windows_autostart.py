@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
 from pathlib import Path
 
-from v380.paths import ROOT
+from v380.paths import DATA_DIR, ROOT
 
 BACKEND_TASK = "OptiviewBackend"
 BACKEND_WATCH_TASK = "OptiviewBackendWatch"
 # Legacy names from older installs
 _LEGACY = ("V380StudioAutoRecord", "V380StudioAutoRecordWatch")
+_PREF_FILE = DATA_DIR / "backend_autostart.json"
 
 
 def _python_exe() -> str:
@@ -38,10 +40,65 @@ def _run_schtasks(args: list[str]) -> None:
     subprocess.run(args, capture_output=True, text=True, timeout=20, check=False)
 
 
-def ensure_autostart(enabled: bool = True) -> None:
-    """Register ONLOGON + 5-minute watchdog so backend restarts after reboot."""
+def autostart_preferred() -> bool:
+    """User preference (default off until explicitly enabled in the app)."""
+    try:
+        if _PREF_FILE.is_file():
+            raw = json.loads(_PREF_FILE.read_text(encoding="utf-8"))
+            if isinstance(raw, dict) and "enabled" in raw:
+                return bool(raw["enabled"])
+    except Exception:
+        pass
+    return False
+
+
+def set_autostart_preferred(enabled: bool) -> None:
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        _PREF_FILE.write_text(
+            json.dumps({"enabled": bool(enabled)}, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+def autostart_status() -> dict:
+    """What Windows currently has registered + the saved preference."""
+    preferred = autostart_preferred()
+    if sys.platform != "win32":
+        return {
+            "ok": True,
+            "platform": sys.platform,
+            "supported": False,
+            "preferred": preferred,
+            "enabled": False,
+            "task": False,
+            "startup_shortcut": False,
+        }
+    task = _task_exists(BACKEND_TASK) or _task_exists(BACKEND_WATCH_TASK)
+    shortcut = _startup_vbs().is_file() or _startup_bat().is_file()
+    return {
+        "ok": True,
+        "platform": "win32",
+        "supported": True,
+        "preferred": preferred,
+        "enabled": bool(task or shortcut),
+        "task": task,
+        "startup_shortcut": shortcut,
+    }
+
+
+def ensure_autostart(enabled: bool | None = None) -> None:
+    """Register or clear ONLOGON + 5-minute watchdog.
+
+    If enabled is None, use the saved preference (default: off).
+    """
     if sys.platform != "win32":
         return
+    if enabled is None:
+        enabled = autostart_preferred()
+    set_autostart_preferred(bool(enabled))
     script = _backend_script()
     if not script.is_file():
         return

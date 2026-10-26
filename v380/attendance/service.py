@@ -18,11 +18,49 @@ JpegProvider = Callable[[int], bytes | None]
 class AttendanceService:
     """Singleton-friendly facade used by HTTP routes and the entrance watcher."""
 
+    # Reject when top staff is not clearly ahead of the next staff (false IDs).
+    MATCH_MARGIN = 0.08
+
     def __init__(self, store: AttendanceStore | None = None):
         self.store = store or AttendanceStore()
         self._match_lock = threading.Lock()
         self._last_match: dict[str, Any] | None = None
         self._last_error: str | None = None
+
+    @classmethod
+    def _match_staff(
+        cls,
+        hit: FaceHit,
+        staff_embs: list[tuple[int, bytes]],
+        *,
+        threshold: float,
+        min_margin: float | None = None,
+    ) -> tuple[int | None, float, float, float]:
+        """Pick best staff for one face.
+
+        Returns (staff_id|None, best_score, second_best_score, effective_threshold).
+        Requires score >= threshold and a clear gap vs the next *different* staff.
+        """
+        margin = float(cls.MATCH_MARGIN if min_margin is None else min_margin)
+        per_staff: dict[int, float] = {}
+        for sid, blob in staff_embs:
+            known = FaceEngine.bytes_to_embedding(blob)
+            score = FaceEngine.cosine(hit.embedding, known)
+            sid_i = int(sid)
+            if score > per_staff.get(sid_i, -1.0):
+                per_staff[sid_i] = score
+        if not per_staff:
+            return None, -1.0, -1.0, float(threshold)
+        ranked = sorted(per_staff.items(), key=lambda kv: kv[1], reverse=True)
+        best_id, best_score = ranked[0]
+        second = ranked[1][1] if len(ranked) > 1 else -1.0
+        # Keep threshold firm — old large-face discounts caused stranger→staff hits.
+        effective_th = float(threshold)
+        if best_score < effective_th:
+            return None, best_score, second, effective_th
+        if second >= 0.0 and (best_score - second) < margin:
+            return None, best_score, second, effective_th
+        return best_id, best_score, second, effective_th
 
     def status(self) -> dict[str, Any]:
         ok, msg = FaceEngine.available()
@@ -91,7 +129,11 @@ class AttendanceService:
         try:
             # Higher det floor + print reject drops wall-banner faces in enroll UI.
             hits = FaceEngine.detect_jpeg(
-                jpeg, min_area=500.0, min_det_score=0.45, reject_prints=True
+                jpeg,
+                min_area=500.0,
+                min_det_score=0.45,
+                reject_prints=True,
+                upscale_small=False,
             )
         except FaceEngineError as exc:
             return {"ok": False, "error": str(exc), "faces": [], "pick_index": None}
@@ -246,6 +288,20 @@ class AttendanceService:
             raise FaceEngineError(
                 "Selected face not clear enough — face the camera with good lighting"
             )
+        # Block duplicate enroll when this face already matches staff.
+        settings = self.store.get_settings()
+        threshold = float(settings["match_threshold"])
+        staff_embs = self.store.list_embeddings()
+        sid, score, _second, _th = self._match_staff(
+            hit, staff_embs, threshold=threshold
+        )
+        if sid is not None:
+            existing = self.store.get_staff(sid) or {}
+            ename = existing.get("name") or f"Staff #{sid}"
+            raise FaceEngineError(
+                f"Already enrolled as {ename} (score {score:.2f}) — "
+                "use Already enrolled? or add a face angle on that staff"
+            )
         photo = FaceEngine.crop_face_jpeg(data, hit.bbox)
         staff = self.store.add_staff(
             name=name,
@@ -320,12 +376,21 @@ class AttendanceService:
         """Match a face and record check-in or check-out for the day session."""
         with self._match_lock:
             try:
+                # Live door poll: no 2× upscale; skip if UI enroll/identify holds the model.
                 hits = FaceEngine.detect_jpeg(
-                    jpeg, min_area=400.0, min_det_score=0.40, reject_prints=True
+                    jpeg,
+                    min_area=400.0,
+                    min_det_score=0.40,
+                    reject_prints=True,
+                    upscale_small=False,
+                    wait=False,
                 )
             except FaceEngineError as exc:
-                self._last_error = str(exc)
-                return {"ok": False, "matched": False, "error": str(exc)}
+                msg = str(exc)
+                self._last_error = msg
+                if "busy" in msg.lower():
+                    return {"ok": True, "matched": False, "skipped": True, "error": "busy"}
+                return {"ok": False, "matched": False, "error": msg}
             if not hits:
                 self._last_error = "No face detected"
                 return {"ok": False, "matched": False, "error": "No face detected"}
@@ -334,32 +399,35 @@ class AttendanceService:
             threshold = float(settings["match_threshold"])
             min_shift = int(settings.get("min_shift_sec") or 1800)
             staff_embs = self.store.list_embeddings()
-            # Check EVERY face — entrance often has larger customers in front of staff.
+            # Check EVERY face — keep the strongest *confident* staff match.
             best_id: int | None = None
             best_score = -1.0
+            best_second = -1.0
             best_hit: FaceHit | None = None
+            effective_th = threshold
             for hit in hits:
-                for sid, blob in staff_embs:
-                    known = FaceEngine.bytes_to_embedding(blob)
-                    score = FaceEngine.cosine(hit.embedding, known)
+                sid, score, second, th = self._match_staff(
+                    hit, staff_embs, threshold=threshold
+                )
+                if sid is None:
                     if score > best_score:
                         best_score = score
-                        best_id = sid
-                        best_hit = hit
+                        best_second = second
+                        effective_th = th
+                    continue
+                if score > best_score:
+                    best_id = sid
+                    best_score = score
+                    best_second = second
+                    best_hit = hit
+                    effective_th = th
 
-            # Fast walk-throughs are blurrier — accept a slightly softer score when
-            # the face is large (close to the door camera).
-            effective_th = threshold
-            if best_hit is not None and best_hit.area >= 2500.0:
-                effective_th = max(0.28, threshold - 0.05)
-            elif best_hit is not None and best_hit.area >= 1200.0:
-                effective_th = max(0.30, threshold - 0.03)
-
-            if best_id is None or best_hit is None or best_score < effective_th:
+            if best_id is None or best_hit is None:
                 self._last_error = None
                 self._last_match = {
                     "matched": False,
                     "score": round(best_score, 4) if best_score >= 0 else None,
+                    "second_score": round(best_second, 4) if best_second >= 0 else None,
                     "faces": len(hits),
                     "threshold": threshold,
                     "at": _now_iso(),
@@ -368,6 +436,7 @@ class AttendanceService:
                     "ok": True,
                     "matched": False,
                     "score": round(best_score, 4) if best_score >= 0 else None,
+                    "second_score": round(best_second, 4) if best_second >= 0 else None,
                     "faces": len(hits),
                     "threshold": effective_th,
                 }
@@ -512,7 +581,11 @@ class AttendanceService:
         if not jpeg:
             raise FaceEngineError("Provide a face photo")
         hits = FaceEngine.detect_jpeg(
-            jpeg, min_area=400.0, min_det_score=0.40, reject_prints=True
+            jpeg,
+            min_area=400.0,
+            min_det_score=0.40,
+            reject_prints=True,
+            upscale_small=False,
         )
         frame_w, frame_h = 0, 0
         try:
@@ -536,28 +609,12 @@ class AttendanceService:
         threshold = float(settings["match_threshold"])
         staff_embs = self.store.list_embeddings()
 
-        def _match_hit(hit: FaceHit) -> tuple[int | None, float, float]:
-            best_id: int | None = None
-            best_score = -1.0
-            for sid, blob in staff_embs:
-                known = FaceEngine.bytes_to_embedding(blob)
-                score = FaceEngine.cosine(hit.embedding, known)
-                if score > best_score:
-                    best_score = score
-                    best_id = sid
-            effective_th = threshold
-            if hit.area >= 2500.0:
-                effective_th = max(0.28, threshold - 0.05)
-            elif hit.area >= 1200.0:
-                effective_th = max(0.30, threshold - 0.03)
-            if best_id is None or best_score < effective_th:
-                return None, best_score, effective_th
-            return best_id, best_score, effective_th
-
         faces_out: list[dict[str, Any]] = []
         for i, hit in enumerate(hits):
             x1, y1, x2, y2 = hit.bbox
-            sid, score, eff_th = _match_hit(hit)
+            sid, score, second, eff_th = self._match_staff(
+                hit, staff_embs, threshold=threshold
+            )
             staff = self.store.get_staff(sid) if sid is not None else None
             already = staff is not None
             name = (staff or {}).get("name") if staff else None
@@ -578,6 +635,7 @@ class AttendanceService:
                     "clear_for_enroll": clear,
                     "already_enrolled": already,
                     "score": round(score, 4) if score >= 0 else None,
+                    "second_score": round(second, 4) if second >= 0 else None,
                     "threshold": eff_th,
                     "staff": staff,
                     "will_enroll": already,
@@ -664,15 +722,15 @@ class AttendanceService:
     ) -> None:
         """Store an extra embedding when this angle differs from existing ones."""
         try:
-            # Need a confident match, but not a near-duplicate of an existing face.
-            if best_score < max(threshold, 0.42):
+            # Only learn from strong matches — weak ones pollute the gallery.
+            if best_score < max(float(threshold), 0.55):
                 return
             if best_score >= 0.88:
                 return  # Already covered tightly.
             if self.store.staff_face_count(staff_id) >= 5:
                 return
             # Prefer reasonably clear detections for gallery quality.
-            if hit.det_score < 0.45 or hit.area < 900:
+            if hit.det_score < 0.50 or hit.area < 1200:
                 return
             # Skip if any stored face is already very close.
             for sid, blob in self.store.list_embeddings():

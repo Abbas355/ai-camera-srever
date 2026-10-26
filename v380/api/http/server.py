@@ -1157,28 +1157,35 @@ class Hub:
         if ses:
             ses.stop()
 
-    def snapshot(self, cam_id: int) -> bytes | None:
-        ses = self.session(cam_id)
+    def live_jpeg(self, cam_id: int) -> bytes | None:
+        """Current in-memory live frame only — never disk cache / HD grab."""
+        ses = self.session(int(cam_id))
         if ses and ses.jpeg:
             return ses.jpeg
+        return None
+
+    def snapshot(self, cam_id: int) -> bytes | None:
+        live = self.live_jpeg(cam_id)
+        if live:
+            return live
+        # Disk preview only as a tiny bridge while the hub is still warming up.
+        # (Old default was 600s — that made Add staff / tiles look 10–30s behind.)
         try:
             from v380.runtime_cache import load_preview
 
-            return load_preview(cam_id)
+            return load_preview(cam_id, max_age_sec=1.5)
         except Exception:
             return None
 
     def attendance_jpeg(self, cam_id: int) -> bytes | None:
-        """Fresh live frame for door check-in — never return a stale HD cache.
+        """Fresh live frame for enroll / identify / check-in.
 
-        Fast walk-throughs miss attendance if we serve a 2–4s-old main-stream
-        grab of an empty doorway. Always prefer the current live JPEG.
+        Never serve disk preview_cache or a multi-second HD main-stream cache —
+        those are the usual cause of Add staff looking 10–30s behind Live.
+
+        Returns immediately (no sleep loop) so face-AI polls do not stall MJPEG.
         """
-        live = self.snapshot(int(cam_id))
-        if live:
-            return live
-        # Fallback only when live session has no frame yet.
-        return self.face_jpeg(int(cam_id), max_age_sec=0.8)
+        return self.live_jpeg(int(cam_id))
 
     def face_jpeg(self, cam_id: int, *, max_age_sec: float = 4.0) -> bytes | None:
         """Best frame for face AI: prefer cached HD main-stream grab, else live JPEG.
@@ -1372,6 +1379,16 @@ class Handler(BaseHTTPRequestHandler):
         path = unquote(urlparse(self.path).path)
         if path in ("/", "/api/ping"):
             self.send_json({"ok": True, "ips": local_ips(), "port": PORT, "app": APP_ID})
+            return
+        if path == "/api/system/autostart":
+            if not self.need_user():
+                return
+            try:
+                from v380.windows_autostart import autostart_status
+
+                self.send_json(autostart_status())
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, 500)
             return
         if path == "/api/index":
             if not self.need_user():
@@ -1754,11 +1771,18 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(data)
                 return
             if parts[1] == "snapshot":
-                jpeg = HUB.snapshot(cam_id)
+                # Prefer live session JPEG; avoid serving a stale disk preview.
+                jpeg = HUB.live_jpeg(cam_id) if hasattr(HUB, "live_jpeg") else HUB.snapshot(cam_id)
                 for _ in range(40):
                     if jpeg:
                         break
                     time.sleep(0.1)
+                    jpeg = (
+                        HUB.live_jpeg(cam_id)
+                        if hasattr(HUB, "live_jpeg")
+                        else HUB.snapshot(cam_id)
+                    )
+                if not jpeg:
                     jpeg = HUB.snapshot(cam_id)
                 if not jpeg:
                     self.send_json({"ok": False, "error": "no frame yet"}, 404)
@@ -1767,6 +1791,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.cors()
                 self.send_header("Content-Type", "image/jpeg")
                 self.send_header("Content-Length", str(len(jpeg)))
+                self.send_header("Cache-Control", "no-store")
                 self.end_headers()
                 self.wfile.write(jpeg)
                 return
@@ -2172,6 +2197,17 @@ class Handler(BaseHTTPRequestHandler):
         if not self.need_user():
             return
         path = unquote(urlparse(self.path).path)
+        if path == "/api/system/autostart":
+            body = self.read_json()
+            enabled = bool(body.get("enabled"))
+            try:
+                from v380.windows_autostart import autostart_status, ensure_autostart
+
+                ensure_autostart(enabled)
+                self.send_json(autostart_status())
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, 500)
+            return
         if path.startswith("/api/attendance"):
             from v380.attendance.routes import try_handle
 
@@ -2266,11 +2302,11 @@ def main() -> None:
             ensure()
         except Exception as exc:
             print("[studio] record worker:", exc)
-    # Keep API + recorder running after reboot (Windows Task Scheduler).
+    # Autostart only when the user enabled it (preference file / UI toggle).
     try:
         from v380.windows_autostart import ensure_autostart
 
-        ensure_autostart(True)
+        ensure_autostart(None)
     except Exception as exc:
         print("[studio] autostart:", exc)
     # Warm live sessions so Home/View do not wait on first RTSP open.

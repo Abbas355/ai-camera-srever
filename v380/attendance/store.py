@@ -63,8 +63,8 @@ CREATE INDEX IF NOT EXISTS idx_attendance_staff_faces_staff
 DEFAULTS: dict[str, str] = {
     "enabled": "0",
     "entrance_camera_id": "",
-    # Cosine on InsightFace — 0.35 catches angle/lighting changes at the door.
-    "match_threshold": "0.35",
+    # Cosine on InsightFace — 0.48 reduces strangers matching as staff.
+    "match_threshold": "0.48",
     "cooldown_sec": "900",
     # Sub-second poll so fast walk-throughs are not missed.
     "poll_interval_sec": "0.5",
@@ -143,6 +143,17 @@ class AttendanceStore:
                 conn.execute(
                     "INSERT INTO attendance_settings(key, value) VALUES('attn_v3', '1')"
                 )
+            # Stricter matching: raise floor so wrong faces are not tagged as staff.
+            if not conn.execute(
+                "SELECT 1 FROM attendance_settings WHERE key='attn_v4'"
+            ).fetchone():
+                conn.execute(
+                    "INSERT INTO attendance_settings(key, value) VALUES('match_threshold', '0.48') "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+                )
+                conn.execute(
+                    "INSERT INTO attendance_settings(key, value) VALUES('attn_v4', '1')"
+                )
             # Backfill primary embedding into faces table for existing staff.
             missing = conn.execute(
                 "SELECT s.id, s.embedding, s.photo_path FROM attendance_staff s "
@@ -184,6 +195,7 @@ class AttendanceStore:
             threshold = float(raw.get("match_threshold") or DEFAULTS["match_threshold"])
         except ValueError:
             threshold = float(DEFAULTS["match_threshold"])
+        threshold = max(0.35, min(0.70, threshold))
         try:
             cooldown = int(float(raw.get("cooldown_sec") or DEFAULTS["cooldown_sec"]))
         except ValueError:
@@ -213,7 +225,10 @@ class AttendanceStore:
             cid = kwargs["entrance_camera_id"]
             mapping["entrance_camera_id"] = "" if cid is None or cid == "" else str(int(cid))
         if "match_threshold" in kwargs and kwargs["match_threshold"] is not None:
-            mapping["match_threshold"] = str(float(kwargs["match_threshold"]))
+            # Clamp: too low → false staff IDs; too high → misses real staff.
+            th = float(kwargs["match_threshold"])
+            th = max(0.35, min(0.70, th))
+            mapping["match_threshold"] = str(th)
         if "cooldown_sec" in kwargs and kwargs["cooldown_sec"] is not None:
             mapping["cooldown_sec"] = str(int(kwargs["cooldown_sec"]))
         if "poll_interval_sec" in kwargs and kwargs["poll_interval_sec"] is not None:

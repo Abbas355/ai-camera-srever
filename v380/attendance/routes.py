@@ -322,10 +322,14 @@ def _jpeg_provider(handler: Any) -> Callable[[int], bytes | None]:
     def get_jpeg(cam_id: int) -> bytes | None:
         if hub is None:
             return None
-        # Prefer HD main-stream grab used by face AI.
-        fn = getattr(hub, "face_jpeg", None) or getattr(hub, "snapshot", None)
-        if callable(fn):
-            return fn(int(cam_id))
+        # Fresh live only — face_jpeg / disk cache made enroll UI look 10–30s behind.
+        for name in ("attendance_jpeg", "live_jpeg", "snapshot"):
+            fn = getattr(hub, name, None)
+            if not callable(fn):
+                continue
+            out = fn(int(cam_id))
+            if out:
+                return out
         return None
 
     return get_jpeg

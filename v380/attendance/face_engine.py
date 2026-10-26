@@ -72,6 +72,8 @@ class FaceEngine:
     """Thread-safe InsightFace FaceAnalysis singleton."""
 
     _lock = threading.Lock()
+    # Serialize onnxruntime get() — concurrent CPU runs thrash under load.
+    _infer_lock = threading.Lock()
     _app: Any | None = None
     _init_error: str | None = None
     _ready: bool = False
@@ -184,11 +186,20 @@ class FaceEngine:
         return img
 
     @classmethod
-    def _detect_raw(cls, img: Any) -> tuple[list[Any], float]:
-        """Run InsightFace; upscale small CCTV frames so distant faces register.
+    def _detect_raw(
+        cls,
+        img: Any,
+        *,
+        upscale_small: bool = True,
+        wait: bool = True,
+    ) -> tuple[list[Any], float]:
+        """Run InsightFace; optionally upscale small CCTV frames.
 
         Returns (faces, scale) where face bboxes are in *original* image coords
         when scale > 1 (detector ran on an upscaled copy).
+
+        upscale_small=False is faster for live enroll/identify polls.
+        wait=False skips when another detect is running (watcher under load).
         """
         try:
             import cv2
@@ -198,10 +209,16 @@ class FaceEngine:
         work = img
         h, w = int(img.shape[0]), int(img.shape[1])
         # Substream ~480p hides table-distance faces; 2× helps buffalo_l a lot.
-        if max(h, w) < 900:
+        if upscale_small and max(h, w) < 900:
             scale = 2.0
             work = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
-        faces = list(cls._ensure().get(work) or [])
+        acquired = cls._infer_lock.acquire(blocking=wait)
+        if not acquired:
+            raise FaceEngineError("face engine busy")
+        try:
+            faces = list(cls._ensure().get(work) or [])
+        finally:
+            cls._infer_lock.release()
         if scale == 1.0:
             return faces, 1.0
         # Map bboxes back to the original JPEG coordinate space.
@@ -316,6 +333,8 @@ class FaceEngine:
         min_det_score: float = 0.0,
         min_face_frac: float = 0.0,
         reject_prints: bool = True,
+        upscale_small: bool = True,
+        wait: bool = True,
     ) -> list[FaceHit]:
         """Detect faces with embeddings and bboxes (largest first).
 
@@ -326,6 +345,8 @@ class FaceEngine:
         substream ~480p and full HD). Absolute min_area is also applied.
 
         reject_prints drops wall-banner / poster faces (office graphics).
+        upscale_small=False skips 2× resize (faster live UI polls).
+        wait=False returns [] immediately if another detect is in progress.
         """
         try:
             img = cls._decode_image(jpeg)
@@ -347,8 +368,10 @@ class FaceEngine:
         # Tiny noise floor (~17×17); real table-distance faces are usually larger.
         area_floor = max(280.0, area_floor)
         try:
-            faces, _ = cls._detect_raw(img)
-        except FaceEngineError:
+            faces, _ = cls._detect_raw(img, upscale_small=upscale_small, wait=wait)
+        except FaceEngineError as exc:
+            if "busy" in str(exc).lower():
+                raise
             return []
         except Exception:
             return []
