@@ -1815,21 +1815,18 @@ def _run_schtasks(args: list[str]) -> None:
 
 
 def _sync_logon_task(enabled: bool) -> None:
-    """Keep Optiview backend (API + recorder) auto-starting on Windows logon.
+    """Recording must not install/remove Windows backend autostart.
 
-    Recording on/off no longer removes the task — the API stays warm after reboot.
+    Autostart is only toggled from the app UI (PUT /api/system/autostart).
+    Legacy worker-only scheduled tasks are cleaned up when recording is off.
     """
     if sys.platform != "win32":
         return
+    if enabled:
+        return
     try:
-        from v380.windows_autostart import ensure_autostart
-
-        # Respect user preference (UI toggle) — do not force-enable on record.
-        ensure_autostart(None)
-        if not enabled:
-            # Legacy worker-only tasks are superseded by OptiviewBackend.
-            _run_schtasks(["schtasks", "/Delete", "/F", "/TN", TASK_NAME])
-            _run_schtasks(["schtasks", "/Delete", "/F", "/TN", WATCH_TASK_NAME])
+        _run_schtasks(["schtasks", "/Delete", "/F", "/TN", TASK_NAME])
+        _run_schtasks(["schtasks", "/Delete", "/F", "/TN", WATCH_TASK_NAME])
     except Exception:
         pass
 

@@ -1184,8 +1184,17 @@ class Hub:
         those are the usual cause of Add staff looking 10–30s behind Live.
 
         Returns immediately (no sleep loop) so face-AI polls do not stall MJPEG.
+        Dual-lens stacked frames are cropped to the lower (face-level) pane.
         """
-        return self.live_jpeg(int(cam_id))
+        jpeg = self.live_jpeg(int(cam_id))
+        if not jpeg:
+            return None
+        try:
+            from v380.attendance.frame_util import normalize_attendance_frame
+
+            return normalize_attendance_frame(jpeg)
+        except Exception:
+            return jpeg
 
     def face_jpeg(self, cam_id: int, *, max_age_sec: float = 4.0) -> bytes | None:
         """Best frame for face AI: prefer cached HD main-stream grab, else live JPEG.
@@ -1324,7 +1333,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def cors(self) -> None:
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Token, Range")
+        self.send_header(
+            "Access-Control-Allow-Headers",
+            "Authorization, Content-Type, X-Token, X-Api-Key, Range",
+        )
         self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
         self.send_header("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges")
 
@@ -1380,6 +1392,12 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/", "/api/ping"):
             self.send_json({"ok": True, "ips": local_ips(), "port": PORT, "app": APP_ID})
             return
+        # Public attendance share API — API key auth (no staff login).
+        if path.startswith("/api/v1/attendance"):
+            from v380.integrations.attendance_public import try_handle_public
+
+            if try_handle_public(self, "GET", path):
+                return
         if path == "/api/system/autostart":
             if not self.need_user():
                 return
@@ -1393,8 +1411,6 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/index":
             if not self.need_user():
                 return
-            from urllib.parse import parse_qs
-
             qs = parse_qs(urlparse(self.path).query or "")
             cam_q = (qs.get("camera") or [""])[0].strip()
             date_q = (qs.get("date") or [""])[0].strip()
@@ -1419,8 +1435,6 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/hls/prepare":
             if not self.need_user():
                 return
-            from urllib.parse import parse_qs
-
             from v380.record.hls import ensure_hls, ensure_hls_async, hls_ready, playlist_for, playlist_rel
 
             qs = parse_qs(urlparse(self.path).query or "")
@@ -1461,8 +1475,6 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/thumb":
             if not self.need_user():
                 return
-            from urllib.parse import parse_qs
-
             from v380.record.thumbs import ensure_thumb
 
             qs = parse_qs(urlparse(self.path).query or "")
@@ -1616,6 +1628,11 @@ class Handler(BaseHTTPRequestHandler):
             from v380.attendance.routes import try_handle
 
             if try_handle(self, "GET", path):
+                return
+        if path.startswith("/api/integrations/attendance"):
+            from v380.integrations.attendance_public import try_handle_manage
+
+            if try_handle_manage(self, "GET", path):
                 return
         if path.startswith("/api/customers"):
             from v380.customers.routes import try_handle
@@ -1771,9 +1788,18 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(data)
                 return
             if parts[1] == "snapshot":
+                qs = parse_qs(urlparse(self.path).query or "")
+                face_mode = (qs.get("face") or qs.get("attendance") or ["0"])[0].strip().lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                }
                 # Prefer live session JPEG; avoid serving a stale disk preview.
+                # Face/attendance dialogs: wait a bit longer for first frame + crop dual-pane.
                 jpeg = HUB.live_jpeg(cam_id) if hasattr(HUB, "live_jpeg") else HUB.snapshot(cam_id)
-                for _ in range(40):
+                tries = 60 if face_mode else 40
+                for _ in range(tries):
                     if jpeg:
                         break
                     time.sleep(0.1)
@@ -1787,6 +1813,13 @@ class Handler(BaseHTTPRequestHandler):
                 if not jpeg:
                     self.send_json({"ok": False, "error": "no frame yet"}, 404)
                     return
+                if face_mode:
+                    try:
+                        from v380.attendance.frame_util import normalize_attendance_frame
+
+                        jpeg = normalize_attendance_frame(jpeg)
+                    except Exception:
+                        pass
                 self.send_response(200)
                 self.cors()
                 self.send_header("Content-Type", "image/jpeg")
@@ -1885,6 +1918,11 @@ class Handler(BaseHTTPRequestHandler):
             from v380.attendance.routes import try_handle
 
             if try_handle(self, "POST", path):
+                return
+        if path.startswith("/api/integrations/attendance"):
+            from v380.integrations.attendance_public import try_handle_manage
+
+            if try_handle_manage(self, "POST", path):
                 return
         if path.startswith("/api/customers"):
             from v380.customers.routes import try_handle
@@ -2251,6 +2289,11 @@ class Handler(BaseHTTPRequestHandler):
 
             if try_handle(self, "DELETE", path):
                 return
+        if path.startswith("/api/integrations/attendance"):
+            from v380.integrations.attendance_public import try_handle_manage
+
+            if try_handle_manage(self, "DELETE", path):
+                return
         if path.startswith("/api/customers"):
             from v380.customers.routes import try_handle
 
@@ -2302,13 +2345,9 @@ def main() -> None:
             ensure()
         except Exception as exc:
             print("[studio] record worker:", exc)
-    # Autostart only when the user enabled it (preference file / UI toggle).
-    try:
-        from v380.windows_autostart import ensure_autostart
-
-        ensure_autostart(None)
-    except Exception as exc:
-        print("[studio] autostart:", exc)
+    # Do not register Windows logon tasks here — that hid the API in the
+    # background. Use Attendance → “Start backend with Windows” (or Share API
+    # setup) only when the user explicitly wants logon autostart.
     # Warm live sessions so Home/View do not wait on first RTSP open.
     try:
         threading.Thread(target=HUB.warm_all, daemon=True, name="warm-hub").start()

@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import threading
 import time
+from datetime import datetime
 from typing import Any, Callable
 
 from v380.attendance.service import get_service
+from v380.attendance.store import exit_window_active, past_closing_time
 
 JpegProvider = Callable[[int], bytes | None]
 
@@ -27,6 +29,8 @@ class AttendanceWatcher:
         self._lock = threading.Lock()
         # After a successful check-in/out, briefly slow down to avoid spam.
         self._quiet_until: float = 0.0
+        # Auto check-out at close runs once per calendar day.
+        self._auto_checkout_day: str | None = None
 
     @classmethod
     def instance(cls) -> AttendanceWatcher:
@@ -83,7 +87,13 @@ class AttendanceWatcher:
             "wired": self._get_jpeg is not None,
         }
 
-    def _tick_once(self, svc: Any, cam_id: int) -> dict[str, Any] | None:
+    def _tick_once(
+        self,
+        svc: Any,
+        cam_id: int,
+        *,
+        purpose: str | None = None,
+    ) -> dict[str, Any] | None:
         if self._get_jpeg is None:
             self._last_error = "no jpeg provider"
             return None
@@ -91,7 +101,7 @@ class AttendanceWatcher:
         if not jpeg:
             self._last_error = "no jpeg"
             return None
-        result = svc.process_frame(jpeg, camera_id=int(cam_id))
+        result = svc.process_frame(jpeg, camera_id=int(cam_id), purpose=purpose)
         self._last_result = {
             "matched": result.get("matched"),
             "action": result.get("action"),
@@ -102,10 +112,41 @@ class AttendanceWatcher:
             "already_checked_in": result.get("already_checked_in"),
             "message": result.get("message"),
             "error": result.get("error"),
+            "camera_id": int(cam_id),
+            "purpose": purpose or "auto",
         }
         self._last_error = result.get("error")
         self._ticks += 1
         self._last_tick = time.time()
+        return result
+
+    def _poll_camera(
+        self,
+        svc: Any,
+        cam_id: int,
+        *,
+        purpose: str | None,
+        allow_burst: bool,
+    ) -> dict[str, Any] | None:
+        t0 = time.time()
+        result = self._tick_once(svc, int(cam_id), purpose=purpose)
+        elapsed_pre = time.time() - t0
+        if (
+            allow_burst
+            and elapsed_pre < 1.2
+            and result
+            and not result.get("matched")
+            and not result.get("error")
+            and int(result.get("faces") or 0) > 0
+        ):
+            for _ in range(3):
+                if self._stop.is_set():
+                    break
+                self._stop.wait(0.2)
+                burst = self._tick_once(svc, int(cam_id), purpose=purpose)
+                if burst and burst.get("matched"):
+                    result = burst
+                    break
         return result
 
     def _loop(self) -> None:
@@ -131,32 +172,79 @@ class AttendanceWatcher:
                 self._stop.wait(min(0.5, self._quiet_until - now))
                 continue
 
+            exit_on = bool(settings.get("exit_camera_enabled"))
+            exit_id = settings.get("exit_camera_id")
+            # Exit cam only polled inside closing window when closing_time is set.
+            in_exit_window = exit_window_active(settings)
+            same_cam = (
+                exit_on
+                and exit_id is not None
+                and int(exit_id) == int(cam_id)
+            )
+            use_exit = (
+                exit_on
+                and exit_id is not None
+                and in_exit_window
+                and not same_cam
+            )
+            # Separate entrance/exit cams: entrance=enter only, exit=exit only.
+            # Same camera for both: purpose=None so one face can check in OR out.
+            if same_cam:
+                enter_purpose = None
+            elif exit_on and exit_id is not None:
+                enter_purpose = "enter"
+            else:
+                enter_purpose = None
+
             t0 = time.time()
             try:
-                result = self._tick_once(svc, int(cam_id))
-                # Burst: face seen but not matched (blur / angle) — retry live frames quickly.
-                # Skip burst when the last tick was already slow (model under load).
-                elapsed_pre = time.time() - t0
+                # Once past closing: force check-out anyone still Working.
+                today = datetime.now().strftime("%Y-%m-%d")
                 if (
-                    elapsed_pre < 1.2
-                    and result
-                    and not result.get("matched")
-                    and not result.get("error")
-                    and int(result.get("faces") or 0) > 0
+                    settings.get("auto_checkout_at_close")
+                    and past_closing_time(settings)
+                    and self._auto_checkout_day != today
                 ):
-                    for _ in range(3):
-                        if self._stop.is_set():
-                            break
-                        self._stop.wait(0.2)
-                        burst = self._tick_once(svc, int(cam_id))
-                        if burst and burst.get("matched"):
-                            result = burst
-                            break
+                    closed = svc.store.force_checkout_open_sessions(
+                        camera_id=int(exit_id) if exit_id is not None else int(cam_id),
+                        reason="closing_time",
+                    )
+                    self._auto_checkout_day = today
+                    if closed:
+                        self._last_result = {
+                            "matched": True,
+                            "action": "auto_checkout",
+                            "count": len(closed),
+                            "message": f"Auto check-out at closing ({len(closed)} staff)",
+                        }
+
+                result = self._poll_camera(
+                    svc, int(cam_id), purpose=enter_purpose, allow_burst=True
+                )
                 if result and result.get("matched") and result.get("action") in {
                     "check_in",
                     "check_out",
                 }:
                     self._quiet_until = time.time() + 4.0
+                elif result and result.get("error"):
+                    self._last_error = str(result.get("error"))
+                elif result is None and self._last_error in (None, ""):
+                    self._last_error = "no jpeg"
+
+                if (
+                    use_exit
+                    and not self._stop.is_set()
+                    and time.time() >= self._quiet_until
+                ):
+                    exit_result = self._poll_camera(
+                        svc, int(exit_id), purpose="exit", allow_burst=True
+                    )
+                    if (
+                        exit_result
+                        and exit_result.get("matched")
+                        and exit_result.get("action") == "check_out"
+                    ):
+                        self._quiet_until = time.time() + 4.0
             except Exception as exc:
                 self._last_error = str(exc)
 

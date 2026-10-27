@@ -63,6 +63,15 @@ CREATE INDEX IF NOT EXISTS idx_attendance_staff_faces_staff
 DEFAULTS: dict[str, str] = {
     "enabled": "0",
     "entrance_camera_id": "",
+    # Optional dedicated exit camera (off = entrance does in + out).
+    "exit_camera_enabled": "0",
+    "exit_camera_id": "",
+    # Restaurant closing (HH:MM local). Empty = no hours gate on exit cam.
+    "closing_time": "",
+    # Exit camera is active from (closing - N minutes) until (closing + 60).
+    "exit_window_minutes": "90",
+    # At closing time, auto check-out anyone still Working (no face needed).
+    "auto_checkout_at_close": "1",
     # Cosine on InsightFace — 0.48 reduces strangers matching as staff.
     "match_threshold": "0.48",
     "cooldown_sec": "900",
@@ -71,6 +80,71 @@ DEFAULTS: dict[str, str] = {
     # Minimum time after check-in before a new face match can count as check-out.
     "min_shift_sec": "1800",
 }
+
+
+def _parse_hhmm(value: str | None) -> tuple[int, int] | None:
+    raw = (value or "").strip()
+    if not raw or ":" not in raw:
+        return None
+    try:
+        hh_s, mm_s = raw.split(":", 1)
+        hh, mm = int(hh_s), int(mm_s)
+        if 0 <= hh <= 23 and 0 <= mm <= 59:
+            return hh, mm
+    except ValueError:
+        pass
+    return None
+
+
+def exit_window_active(
+    settings: dict[str, Any],
+    *,
+    now: datetime | None = None,
+) -> bool:
+    """True when exit camera should poll.
+
+    No closing_time → always active (if exit cam enabled by caller).
+    With closing_time → active in [closing - window, closing + 60 min].
+    """
+    parsed = _parse_hhmm(str(settings.get("closing_time") or ""))
+    if parsed is None:
+        return True
+    now = now or datetime.now()
+    try:
+        window = int(float(settings.get("exit_window_minutes") or 90))
+    except (TypeError, ValueError):
+        window = 90
+    window = max(15, min(360, window))
+    hh, mm = parsed
+    close_dt = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    start = close_dt - timedelta(minutes=window)
+    end = close_dt + timedelta(minutes=60)
+    # Overnight close (e.g. 01:00): window may start previous calendar day.
+    if start <= now <= end:
+        return True
+    # If close is early morning and now is late evening before midnight.
+    if close_dt < now and (close_dt + timedelta(days=1) - timedelta(minutes=window)) <= now:
+        return True
+    if close_dt > now and (close_dt - timedelta(days=1)) <= now <= (
+        close_dt - timedelta(days=1) + timedelta(minutes=60)
+    ):
+        return True
+    return False
+
+
+def past_closing_time(
+    settings: dict[str, Any],
+    *,
+    now: datetime | None = None,
+) -> bool:
+    """True when local time is at/after closing today (for auto check-out)."""
+    parsed = _parse_hhmm(str(settings.get("closing_time") or ""))
+    if parsed is None:
+        return False
+    now = now or datetime.now()
+    hh, mm = parsed
+    close_dt = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    return now >= close_dt
 
 
 def _now() -> str:
@@ -92,6 +166,21 @@ def _parse_ts(value: str) -> datetime | None:
         except ValueError:
             continue
     return None
+
+
+def _row_cam(row: sqlite3.Row | None) -> int | None:
+    if row is None:
+        return None
+    try:
+        raw = row["camera_id"]
+    except (KeyError, IndexError):
+        return None
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
 
 
 def _fmt_duration(seconds: int | None) -> str | None:
@@ -191,6 +280,11 @@ class AttendanceStore:
             entrance = int(cam_raw) if cam_raw else None
         except ValueError:
             entrance = None
+        exit_raw = (raw.get("exit_camera_id") or "").strip()
+        try:
+            exit_cam = int(exit_raw) if exit_raw else None
+        except ValueError:
+            exit_cam = None
         try:
             threshold = float(raw.get("match_threshold") or DEFAULTS["match_threshold"])
         except ValueError:
@@ -208,14 +302,46 @@ class AttendanceStore:
             min_shift = int(float(raw.get("min_shift_sec") or DEFAULTS["min_shift_sec"]))
         except ValueError:
             min_shift = int(DEFAULTS["min_shift_sec"])
-        return {
+        closing_raw = (raw.get("closing_time") or "").strip()
+        closing = closing_raw if _parse_hhmm(closing_raw) else ""
+        try:
+            exit_win = int(float(raw.get("exit_window_minutes") or DEFAULTS["exit_window_minutes"]))
+        except ValueError:
+            exit_win = int(DEFAULTS["exit_window_minutes"])
+        exit_win = max(15, min(360, exit_win))
+        # Heal: Auto check-in with no entrance but an exit cam set → use exit as entrance
+        # so the watcher actually runs (common one-camera setups).
+        if entrance is None and exit_cam is not None:
+            entrance = int(exit_cam)
+            try:
+                with self._lock:
+                    with self._connect() as conn:
+                        conn.execute(
+                            "INSERT INTO attendance_settings(key, value) VALUES(?, ?) "
+                            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                            ("entrance_camera_id", str(entrance)),
+                        )
+                        conn.commit()
+            except Exception:
+                pass
+        settings = {
             "enabled": (raw.get("enabled") or "0").strip() in {"1", "true", "yes", "on"},
             "entrance_camera_id": entrance,
+            "exit_camera_enabled": (raw.get("exit_camera_enabled") or "0").strip()
+            in {"1", "true", "yes", "on"},
+            "exit_camera_id": exit_cam,
+            "closing_time": closing,
+            "exit_window_minutes": exit_win,
+            "auto_checkout_at_close": (raw.get("auto_checkout_at_close") or "1").strip()
+            in {"1", "true", "yes", "on"},
             "match_threshold": threshold,
             "cooldown_sec": cooldown,
             "poll_interval_sec": max(0.5, poll),
             "min_shift_sec": max(60, min_shift),
         }
+        settings["exit_window_active"] = exit_window_active(settings)
+        settings["past_closing"] = past_closing_time(settings)
+        return settings
 
     def update_settings(self, **kwargs: Any) -> dict[str, Any]:
         mapping: dict[str, str] = {}
@@ -224,6 +350,26 @@ class AttendanceStore:
         if "entrance_camera_id" in kwargs:
             cid = kwargs["entrance_camera_id"]
             mapping["entrance_camera_id"] = "" if cid is None or cid == "" else str(int(cid))
+        if "exit_camera_enabled" in kwargs and kwargs["exit_camera_enabled"] is not None:
+            mapping["exit_camera_enabled"] = (
+                "1" if bool(kwargs["exit_camera_enabled"]) else "0"
+            )
+        if "exit_camera_id" in kwargs:
+            cid = kwargs["exit_camera_id"]
+            mapping["exit_camera_id"] = "" if cid is None or cid == "" else str(int(cid))
+        if "closing_time" in kwargs and kwargs["closing_time"] is not None:
+            raw_ct = str(kwargs["closing_time"]).strip()
+            mapping["closing_time"] = raw_ct if _parse_hhmm(raw_ct) else ""
+        if "exit_window_minutes" in kwargs and kwargs["exit_window_minutes"] is not None:
+            try:
+                w = int(float(kwargs["exit_window_minutes"]))
+            except (TypeError, ValueError):
+                w = 90
+            mapping["exit_window_minutes"] = str(max(15, min(360, w)))
+        if "auto_checkout_at_close" in kwargs and kwargs["auto_checkout_at_close"] is not None:
+            mapping["auto_checkout_at_close"] = (
+                "1" if bool(kwargs["auto_checkout_at_close"]) else "0"
+            )
         if "match_threshold" in kwargs and kwargs["match_threshold"] is not None:
             # Clamp: too low → false staff IDs; too high → misses real staff.
             th = float(kwargs["match_threshold"])
@@ -538,13 +684,66 @@ class AttendanceStore:
                 ).fetchone()
         return self._event_row(row) if row else None
 
+    def list_open_sessions(self, *, staff_id: int | None = None) -> list[dict[str, Any]]:
+        """Sessions still Working (unpaired check-in), including overnight shifts."""
+        since = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+        with self._lock:
+            with self._connect() as conn:
+                q = (
+                    "SELECT e.id, e.staff_id, e.event_type, e.camera_id, e.score, e.created_at, "
+                    "s.name AS staff_name, s.role AS staff_role "
+                    "FROM attendance_events e JOIN attendance_staff s ON s.id=e.staff_id "
+                    "WHERE e.created_at >= ?"
+                )
+                args: list[Any] = [f"{since}T00:00:00"]
+                if staff_id is not None:
+                    q += " AND e.staff_id=?"
+                    args.append(int(staff_id))
+                q += " ORDER BY e.staff_id ASC, e.id ASC"
+                rows = conn.execute(q, args).fetchall()
+        return [s for s in self._sessions_from_rows(rows) if s.get("status") == "working"]
+
     def open_session(self, staff_id: int, *, day: str | None = None) -> dict[str, Any] | None:
-        """Latest unpaired check-in today (no check-out after it)."""
-        sessions = self.list_sessions(day=day, staff_id=int(staff_id))
-        for s in sessions:
-            if s.get("status") == "working":
-                return s
-        return None
+        """Latest unpaired check-in (no check-out after it).
+
+        When [day] is omitted, searches recent days so overnight shifts stay Working
+        instead of looking Absent the next calendar day.
+        """
+        if day is not None:
+            sessions = self.list_sessions(day=day, staff_id=int(staff_id))
+            for s in sessions:
+                if s.get("status") == "working":
+                    return s
+            return None
+        opens = self.list_open_sessions(staff_id=int(staff_id))
+        return opens[0] if opens else None
+
+    def force_checkout_open_sessions(
+        self,
+        *,
+        camera_id: int | None = None,
+        reason: str = "closing_time",
+    ) -> list[dict[str, Any]]:
+        """Check out everyone still Working (including overnight open shifts)."""
+        open_ones = self.list_open_sessions()
+        out: list[dict[str, Any]] = []
+        for s in open_ones:
+            sid = int(s["staff_id"])
+            ev = self.add_event(
+                staff_id=sid,
+                event_type="check_out",
+                camera_id=camera_id,
+                score=None,
+            )
+            out.append(
+                {
+                    "staff_id": sid,
+                    "staff_name": s.get("staff_name"),
+                    "event": ev,
+                    "reason": reason,
+                }
+            )
+        return out
 
     def last_event_for(self, staff_id: int) -> dict[str, Any] | None:
         with self._lock:
@@ -584,8 +783,13 @@ class AttendanceStore:
         day: str | None = None,
         staff_id: int | None = None,
     ) -> list[dict[str, Any]]:
-        """Pair check-in / check-out into day sessions with duration."""
+        """Pair check-in / check-out into day sessions with duration.
+
+        For the current calendar day, also attaches overnight Working sessions that
+        started on an earlier day so the board shows Present/Working correctly.
+        """
         day = (day or _today_prefix()).strip()
+        today = _today_prefix()
         with self._lock:
             with self._connect() as conn:
                 q = (
@@ -600,7 +804,21 @@ class AttendanceStore:
                     args.append(int(staff_id))
                 q += " ORDER BY e.staff_id ASC, e.id ASC"
                 rows = conn.execute(q, args).fetchall()
-        return self._sessions_from_rows(rows)
+        sessions = self._sessions_from_rows(rows)
+        if day == today:
+            for s in self.list_open_sessions(staff_id=staff_id):
+                cin_day = str(s.get("check_in") or "")[:10]
+                if not cin_day or cin_day >= day:
+                    continue
+                already = any(
+                    int(x.get("staff_id") or 0) == int(s.get("staff_id") or 0)
+                    and str(x.get("check_in") or "") == str(s.get("check_in") or "")
+                    for x in sessions
+                )
+                if not already:
+                    sessions.append(s)
+            sessions.sort(key=lambda s: s.get("check_in") or "", reverse=True)
+        return sessions
 
     def list_sessions_for_staff(
         self,
@@ -624,40 +842,138 @@ class AttendanceStore:
         return self._sessions_from_rows(rows)
 
     def staff_detail(self, staff_id: int, *, days: int = 30) -> dict[str, Any] | None:
-        """Staff profile + visit history (entry/exit/duration) + totals."""
+        """Staff profile + visit history (entry/exit/duration) + day calendar."""
         staff = self.get_staff(int(staff_id))
         if staff is None:
             return None
+        days = max(1, min(120, int(days)))
         sessions = self.list_sessions_for_staff(int(staff_id), days=days)
         today = _today_prefix()
-        today_sessions = [s for s in sessions if str(s.get("check_in") or "").startswith(today)]
+        today_sessions = [
+            s for s in sessions if str(s.get("check_in") or "").startswith(today)
+        ]
+        open_any = next((s for s in sessions if s.get("status") == "working"), None)
+        # Overnight: still Working from yesterday → Present/Working today.
+        overnight = bool(
+            open_any is not None
+            and not str(open_any.get("check_in") or "").startswith(today)
+        )
+        if overnight and open_any is not None:
+            today_sessions = [open_any, *today_sessions]
         working_now = any(s.get("status") == "working" for s in today_sessions)
-        today_sec = sum(int(s.get("duration_sec") or 0) for s in today_sessions)
+        today_sec = sum(
+            int(s.get("duration_sec") or 0)
+            for s in today_sessions
+            if str(s.get("check_in") or "").startswith(today)
+        )
+        if overnight and open_any is not None:
+            # Count only time since local midnight for the overnight open shift.
+            start = _parse_ts(str(open_any.get("check_in") or ""))
+            midnight = datetime.now().replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            if start is not None and start < midnight:
+                today_sec += max(0, int((datetime.now() - midnight).total_seconds()))
+            elif start is not None:
+                today_sec += max(0, int(open_any.get("duration_sec") or 0))
         all_sec = sum(int(s.get("duration_sec") or 0) for s in sessions)
         days_present = {
             str(s.get("check_in") or "")[:10]
             for s in sessions
             if s.get("check_in")
         }
+        if overnight:
+            days_present.add(today)
+        # Day-by-day present / absent for the UI calendar (oldest → newest).
+        by_day: dict[str, list[dict[str, Any]]] = {}
+        for s in sessions:
+            d = str(s.get("day") or "")[:10]
+            if d:
+                by_day.setdefault(d, []).append(s)
+        calendar: list[dict[str, Any]] = []
+        today_d = datetime.now().date()
+        for i in range(days - 1, -1, -1):
+            d = (today_d - timedelta(days=i)).strftime("%Y-%m-%d")
+            day_sess = list(by_day.get(d, []))
+            if d == today and overnight and open_any is not None:
+                if not any(
+                    str(x.get("check_in") or "") == str(open_any.get("check_in") or "")
+                    for x in day_sess
+                ):
+                    day_sess = [open_any, *day_sess]
+            present = bool(day_sess)
+            working = any(x.get("status") == "working" for x in day_sess)
+            if d == today and overnight:
+                present = True
+                working = True
+            sec = sum(int(x.get("duration_sec") or 0) for x in day_sess)
+            if d == today and overnight and open_any is not None:
+                start = _parse_ts(str(open_any.get("check_in") or ""))
+                midnight = datetime.now().replace(
+                    hour=0, minute=0, second=0, microsecond=0
+                )
+                if start is not None and start < midnight:
+                    # Prefer "time since midnight" over full multi-day duration.
+                    sec = sum(
+                        int(x.get("duration_sec") or 0)
+                        for x in day_sess
+                        if str(x.get("check_in") or "").startswith(today)
+                    ) + max(0, int((datetime.now() - midnight).total_seconds()))
+            cams = sorted(
+                {
+                    int(c)
+                    for x in day_sess
+                    for c in (x.get("camera_id_in"), x.get("camera_id_out"), x.get("camera_id"))
+                    if c is not None
+                }
+            )
+            if working:
+                status = "working"
+            elif present:
+                status = "present"
+            else:
+                status = "absent"
+            calendar.append(
+                {
+                    "day": d,
+                    "present": present,
+                    "status": status,
+                    "session_count": len(day_sess),
+                    "time_sec": sec,
+                    "time": _fmt_duration(sec) if present else None,
+                    "camera_ids": cams,
+                }
+            )
         face_count = self.staff_face_count(int(staff_id))
         staff = {**staff, "face_count": face_count}
+        absent_count = sum(1 for c in calendar if not c["present"])
+        present_today = bool(today_sessions) or overnight
         return {
             "ok": True,
             "staff": staff,
             "sessions": sessions,
             "sessions_today": today_sessions,
+            "calendar": calendar,
             "summary": {
                 "days": int(days),
                 "visit_count": len(sessions),
                 "visits_today": len(today_sessions),
                 "days_present": len(days_present),
+                "days_absent": absent_count,
                 "time_today_sec": today_sec,
                 "time_today": _fmt_duration(today_sec),
                 "time_total_sec": all_sec,
                 "time_total": _fmt_duration(all_sec),
                 "working_now": working_now,
+                "today_status": (
+                    "working"
+                    if working_now
+                    else ("present" if present_today else "absent")
+                ),
                 "face_count": face_count,
-                "open_session": next(
+                "open_session": open_any
+                if working_now
+                else next(
                     (s for s in today_sessions if s.get("status") == "working"),
                     None,
                 ),
@@ -685,6 +1001,8 @@ class AttendanceStore:
                                 staff_role=open_in["staff_role"],
                                 check_in=open_in["created_at"],
                                 check_out=None,
+                                camera_id_in=_row_cam(open_in),
+                                camera_id_out=None,
                                 now=now,
                             )
                         )
@@ -697,6 +1015,8 @@ class AttendanceStore:
                             staff_role=open_in["staff_role"],
                             check_in=open_in["created_at"],
                             check_out=ev["created_at"],
+                            camera_id_in=_row_cam(open_in),
+                            camera_id_out=_row_cam(ev),
                             now=now,
                         )
                     )
@@ -709,6 +1029,8 @@ class AttendanceStore:
                         staff_role=open_in["staff_role"],
                         check_in=open_in["created_at"],
                         check_out=None,
+                        camera_id_in=_row_cam(open_in),
+                        camera_id_out=None,
                         now=now,
                     )
                 )
@@ -726,6 +1048,8 @@ class AttendanceStore:
         check_in: str,
         check_out: str | None,
         now: datetime,
+        camera_id_in: int | None = None,
+        camera_id_out: int | None = None,
     ) -> dict[str, Any]:
         start = _parse_ts(check_in)
         end = _parse_ts(check_out) if check_out else None
@@ -751,6 +1075,10 @@ class AttendanceStore:
             "duration_sec": dur,
             "duration": _fmt_duration(dur),
             "status": status,
+            # Primary camera = where they checked in (entrance).
+            "camera_id": camera_id_in,
+            "camera_id_in": camera_id_in,
+            "camera_id_out": camera_id_out,
         }
 
     def summary_today(self) -> dict[str, Any]:

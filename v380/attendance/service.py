@@ -84,6 +84,11 @@ class AttendanceService:
         settings = self.store.update_settings(
             enabled=body.get("enabled"),
             entrance_camera_id=body.get("entrance_camera_id"),
+            exit_camera_enabled=body.get("exit_camera_enabled"),
+            exit_camera_id=body.get("exit_camera_id"),
+            closing_time=body.get("closing_time"),
+            exit_window_minutes=body.get("exit_window_minutes"),
+            auto_checkout_at_close=body.get("auto_checkout_at_close"),
             match_threshold=body.get("match_threshold"),
             cooldown_sec=body.get("cooldown_sec"),
             poll_interval_sec=body.get("poll_interval_sec"),
@@ -372,8 +377,18 @@ class AttendanceService:
         *,
         camera_id: int | None = None,
         force: bool = False,
+        purpose: str | None = None,
     ) -> dict[str, Any]:
-        """Match a face and record check-in or check-out for the day session."""
+        """Match a face and record check-in or check-out for the day session.
+
+        purpose:
+          None / \"auto\" — entrance does both (legacy)
+          \"enter\" — check-in only (used when exit camera is enabled)
+          \"exit\" — check-out only (dedicated exit camera)
+        """
+        purpose_n = (purpose or "auto").strip().lower()
+        if purpose_n not in {"auto", "enter", "exit"}:
+            purpose_n = "auto"
         with self._match_lock:
             try:
                 # Live door poll: no 2× upscale; skip if UI enroll/identify holds the model.
@@ -456,6 +471,30 @@ class AttendanceService:
 
             # Already working — check out only after min shift (or force via Scan).
             if open_session is not None:
+                # Entrance-only mode: never check out here when exit camera is used.
+                if purpose_n == "enter" and not force:
+                    self._last_match = {
+                        "matched": True,
+                        "action": "working",
+                        "staff": staff,
+                        "score": score_r,
+                        "session": open_session,
+                        "at": _now_iso(),
+                    }
+                    self._last_error = None
+                    return {
+                        "ok": True,
+                        "matched": True,
+                        "action": "working",
+                        "already_checked_in": True,
+                        "staff": staff,
+                        "score": score_r,
+                        "session": open_session,
+                        "message": (
+                            f"{staff.get('name')} is checked in — use exit camera to check out"
+                        ),
+                    }
+
                 worked = int(open_session.get("duration_sec") or 0)
                 if not force and worked < min_shift:
                     self._last_match = {
@@ -524,6 +563,27 @@ class AttendanceService:
                             if completed and completed.get("duration")
                             else ""
                         )
+                    ),
+                }
+
+            # Exit camera: only check out — do not create a new check-in.
+            if purpose_n == "exit":
+                self._last_match = {
+                    "matched": True,
+                    "action": "ignored",
+                    "staff": staff,
+                    "score": score_r,
+                    "at": _now_iso(),
+                }
+                self._last_error = None
+                return {
+                    "ok": True,
+                    "matched": True,
+                    "action": "ignored",
+                    "staff": staff,
+                    "score": score_r,
+                    "message": (
+                        f"{staff.get('name')} is not checked in — exit camera ignored"
                     ),
                 }
 
