@@ -45,7 +45,13 @@ class AttendanceWatcher:
     def apply_settings(self, settings: dict[str, Any] | None = None) -> None:
         svc = get_service()
         settings = settings or svc.get_settings()
-        if settings.get("enabled") and settings.get("entrance_camera_id") is not None:
+        enter_on = settings.get("entrance_camera_enabled", True)
+        exit_on = bool(settings.get("exit_camera_enabled"))
+        has_cam = (
+            settings.get("entrance_camera_id") is not None
+            or settings.get("exit_camera_id") is not None
+        )
+        if settings.get("enabled") and has_cam and (enter_on or exit_on):
             self.start()
         else:
             self.stop()
@@ -160,8 +166,25 @@ class AttendanceWatcher:
                 self._last_error = "disabled"
                 self._stop.wait(max(1.0, base_interval))
                 continue
+            if self._get_jpeg is None:
+                self._last_error = "no jpeg provider"
+                self._stop.wait(max(1.0, base_interval))
+                continue
+
+            enter_on = settings.get("entrance_camera_enabled", True)
+            exit_on = bool(settings.get("exit_camera_enabled"))
             cam_id = settings.get("entrance_camera_id")
-            if cam_id is None or self._get_jpeg is None:
+            exit_id = settings.get("exit_camera_id")
+            if exit_id is None and exit_on and cam_id is not None:
+                exit_id = cam_id
+            if cam_id is None and exit_id is not None:
+                cam_id = exit_id
+
+            if not enter_on and not exit_on:
+                self._last_error = "enter and exit tracking off"
+                self._stop.wait(max(1.0, base_interval))
+                continue
+            if cam_id is None and exit_id is None:
                 self._last_error = "no entrance camera"
                 self._stop.wait(max(1.0, base_interval))
                 continue
@@ -172,29 +195,20 @@ class AttendanceWatcher:
                 self._stop.wait(min(0.5, self._quiet_until - now))
                 continue
 
-            exit_on = bool(settings.get("exit_camera_enabled"))
-            exit_id = settings.get("exit_camera_id")
             # Exit cam only polled inside closing window when closing_time is set.
             in_exit_window = exit_window_active(settings)
-            same_cam = (
-                exit_on
+            physical_same = (
+                cam_id is not None
                 and exit_id is not None
                 and int(exit_id) == int(cam_id)
             )
-            use_exit = (
-                exit_on
-                and exit_id is not None
-                and in_exit_window
-                and not same_cam
-            )
-            # Separate entrance/exit cams: entrance=enter only, exit=exit only.
-            # Same camera for both: purpose=None so one face can check in OR out.
-            if same_cam:
+            # Both directions on one cam → one poll with purpose=None (in or out).
+            same_cam_both = enter_on and exit_on and physical_same
+            # Separate cams: entrance=enter only. Exit-only → no entrance poll.
+            if same_cam_both or (enter_on and not exit_on):
                 enter_purpose = None
-            elif exit_on and exit_id is not None:
-                enter_purpose = "enter"
             else:
-                enter_purpose = None
+                enter_purpose = "enter"
 
             t0 = time.time()
             try:
@@ -218,19 +232,33 @@ class AttendanceWatcher:
                             "message": f"Auto check-out at closing ({len(closed)} staff)",
                         }
 
-                result = self._poll_camera(
-                    svc, int(cam_id), purpose=enter_purpose, allow_burst=True
-                )
-                if result and result.get("matched") and result.get("action") in {
-                    "check_in",
-                    "check_out",
-                }:
-                    self._quiet_until = time.time() + 4.0
-                elif result and result.get("error"):
-                    self._last_error = str(result.get("error"))
-                elif result is None and self._last_error in (None, ""):
-                    self._last_error = "no jpeg"
+                if enter_on and cam_id is not None:
+                    result = self._poll_camera(
+                        svc, int(cam_id), purpose=enter_purpose, allow_burst=True
+                    )
+                    if result and result.get("matched") and result.get("action") in {
+                        "check_in",
+                        "check_out",
+                    }:
+                        self._quiet_until = time.time() + 4.0
+                    elif result and result.get("matched") and result.get("action") == "working":
+                        # Surface "still Working / wait for check-out" on Live monitor.
+                        pass
+                    elif result and result.get("error"):
+                        self._last_error = str(result.get("error"))
+                    elif result is None and self._last_error in (None, ""):
+                        self._last_error = "no jpeg"
 
+                # Exit poll: dedicated exit cam, or exit-only (Enter off) on same cam.
+                # Skip when same-cam both already handled above with purpose=None.
+                use_exit = (
+                    exit_on
+                    and exit_id is not None
+                    and in_exit_window
+                    and not same_cam_both
+                )
+                if not in_exit_window and exit_on and not enter_on:
+                    self._last_error = "exit window closed — waiting for closing hours"
                 if (
                     use_exit
                     and not self._stop.is_set()

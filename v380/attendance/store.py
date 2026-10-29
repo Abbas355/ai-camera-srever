@@ -63,7 +63,9 @@ CREATE INDEX IF NOT EXISTS idx_attendance_staff_faces_staff
 DEFAULTS: dict[str, str] = {
     "enabled": "0",
     "entrance_camera_id": "",
-    # Optional dedicated exit camera (off = entrance does in + out).
+    # When off, watcher skips check-in polls (exit-only mode still possible).
+    "entrance_camera_enabled": "1",
+    # Optional dedicated exit tracking (off = entrance does in + out if entrance on).
     "exit_camera_enabled": "0",
     "exit_camera_id": "",
     # Restaurant closing (HH:MM local). Empty = no hours gate on exit cam.
@@ -77,8 +79,8 @@ DEFAULTS: dict[str, str] = {
     "cooldown_sec": "900",
     # Sub-second poll so fast walk-throughs are not missed.
     "poll_interval_sec": "0.5",
-    # Minimum time after check-in before a new face match can count as check-out.
-    "min_shift_sec": "1800",
+    # Minimum time after check-in before same-cam auto mode can check out (exit purpose uses 60s).
+    "min_shift_sec": "300",
 }
 
 
@@ -327,6 +329,8 @@ class AttendanceStore:
         settings = {
             "enabled": (raw.get("enabled") or "0").strip() in {"1", "true", "yes", "on"},
             "entrance_camera_id": entrance,
+            "entrance_camera_enabled": (raw.get("entrance_camera_enabled") or "1").strip()
+            in {"1", "true", "yes", "on"},
             "exit_camera_enabled": (raw.get("exit_camera_enabled") or "0").strip()
             in {"1", "true", "yes", "on"},
             "exit_camera_id": exit_cam,
@@ -350,6 +354,10 @@ class AttendanceStore:
         if "entrance_camera_id" in kwargs:
             cid = kwargs["entrance_camera_id"]
             mapping["entrance_camera_id"] = "" if cid is None or cid == "" else str(int(cid))
+        if "entrance_camera_enabled" in kwargs and kwargs["entrance_camera_enabled"] is not None:
+            mapping["entrance_camera_enabled"] = (
+                "1" if bool(kwargs["entrance_camera_enabled"]) else "0"
+            )
         if "exit_camera_enabled" in kwargs and kwargs["exit_camera_enabled"] is not None:
             mapping["exit_camera_enabled"] = (
                 "1" if bool(kwargs["exit_camera_enabled"]) else "0"

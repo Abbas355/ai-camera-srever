@@ -84,6 +84,7 @@ class AttendanceService:
         settings = self.store.update_settings(
             enabled=body.get("enabled"),
             entrance_camera_id=body.get("entrance_camera_id"),
+            entrance_camera_enabled=body.get("entrance_camera_enabled"),
             exit_camera_enabled=body.get("exit_camera_enabled"),
             exit_camera_id=body.get("exit_camera_id"),
             closing_time=body.get("closing_time"),
@@ -496,7 +497,11 @@ class AttendanceService:
                     }
 
                 worked = int(open_session.get("duration_sec") or 0)
-                if not force and worked < min_shift:
+                # Dedicated exit purpose: short grace only (door exit should punch Out).
+                # Auto/same-cam mode keeps full min_shift so In→Out doesn't flip instantly.
+                need_sec = 60 if purpose_n == "exit" else min_shift
+                if not force and worked < need_sec:
+                    left = max(0, need_sec - worked)
                     self._last_match = {
                         "matched": True,
                         "action": "working",
@@ -514,10 +519,17 @@ class AttendanceService:
                         "staff": staff,
                         "score": score_r,
                         "session": open_session,
+                        "min_shift_sec": need_sec,
+                        "seconds_until_checkout": left,
                         "message": (
                             f"{staff.get('name')} is checked in since "
                             f"{open_session.get('check_in_time')} "
                             f"({open_session.get('duration')} so far)"
+                            + (
+                                f" — check-out in ~{left // 60}m {left % 60}s"
+                                if left > 0
+                                else ""
+                            )
                         ),
                     }
 
